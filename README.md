@@ -7,6 +7,19 @@ access only during explicit model setup for the revision-pinned files declared b
 the installed release. Local inference and model-status refreshes do not contact
 an update or model feed.
 
+## Screenshots
+
+The screenshots below use fabricated demo meetings, speakers, and transcript
+text. They do not contain data from a personal SayTrace installation.
+
+### Transcript workspace
+
+![SayTrace transcript workspace showing speaker-labelled demo text](docs/images/saytrace-transcript.png)
+
+### Local meeting library
+
+![SayTrace local meeting library populated with fictional demo meetings](docs/images/saytrace-library.png)
+
 ## Architecture
 
 - **React + TypeScript:** the desktop interface and ephemeral presentation state.
