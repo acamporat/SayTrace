@@ -1,0 +1,67 @@
+# Frontend
+node_modules/
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Tauri / Rust
+src-tauri/target/
+target/
+
+# Python
+.venv/
+worker/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+worker/build/
+worker/dist/
+*.egg-info/
+
+# Local models and runtime packs
+models/
+runtimes/
+*.onnx
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# App runtime data and recordings
+.local-transcript/
+recordings/
+work/
+logs/
+backups/
+*.db
+*.db-shm
+*.db-wal
+*.partial
+*.part
+
+# Packaging and signing
+artifacts/
+*.msi
+*.msix
+*.nupkg
+*.pfx
+*.cer
+
+# Environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# QA screenshots and temporary output
+qa/
+tmp/
+playwright-report/
+test-results/

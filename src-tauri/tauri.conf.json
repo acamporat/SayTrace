@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SayTrace",
+  "version": "0.1.0",
+  "identifier": "com.localtranscript.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data: blob:; media-src 'self' asset: localtranscript: http://localtranscript.localhost blob:; connect-src 'self' ipc: http://ipc.localhost http://localtranscript.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "SayTrace",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1080,
+        "minHeight": 680,
+        "center": true,
+        "decorations": false,
+        "resizable": true,
+        "transparent": false,
+        "shadow": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "../packaging/app-installer-hooks.nsh"
+      }
+    }
+  }
+}

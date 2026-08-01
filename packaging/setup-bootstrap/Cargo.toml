@@ -1,0 +1,22 @@
+[package]
+name = "local-transcript-setup-bootstrap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+authors = ["acamporat"]
+license = "Apache-2.0"
+repository = "https://github.com/acamporat/SayTrace"
+
+[dependencies]
+sha2 = "0.10.9"
+windows-sys = { version = "0.61.2", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+winresource = "0.1.23"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+panic = "abort"
+strip = true

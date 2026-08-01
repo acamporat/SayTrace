@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "app_identifier": "com.localtranscript.desktop",
+  "worker_protocol_version": "1.0",
+  "pipeline_version": "2026.07.28.1",
+  "runtime_pack_format": 1,
+  "runtime_variants": {
+    "cpu": {
+      "backend": "CPU",
+      "fallback": "CPU int8"
+    },
+    "nvidia": {
+      "backend": "NVIDIA CUDA",
+      "fallback": "CPU int8"
+    }
+  },
+  "models": {
+    "live_asr_en": "9793ccc07920e0f830e1dba0343efcdf0ef8c903",
+    "final_asr_en": "edaa852ec7e145841d8ffdb056a99866b5f0a478",
+    "alignment_en": "22aad52d435eb6dbaf354bdad9b0da84ce7d6156",
+    "diarization": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
+    "speaker_embedding": "837717ddb9ff5507820346191109dc79c958d614"
+  }
+}

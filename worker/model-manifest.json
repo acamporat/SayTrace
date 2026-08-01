@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "pipeline_version": "2026.07.28.1",
+  "models": [
+    {
+      "key": "live_asr_en",
+      "purpose": "live English draft transcription",
+      "repository": "distil-whisper/distil-large-v3.5-ct2",
+      "revision": "9793ccc07920e0f830e1dba0343efcdf0ef8c903",
+      "license": "MIT",
+      "gated": false,
+      "files": [
+        {
+          "path": "config.json",
+          "size": 2690,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "90c55f775cc4e0bb17293d0bf12f96557a486f20dea886fabd8e6075a3588b21"
+          }
+        },
+        {
+          "path": "model.bin",
+          "size": 1512927867,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "c58b88b8585ffcd2135fddaaf421ce72cb223b32edea70d156aed1dea319a119"
+          }
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size": 340,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711"
+          }
+        },
+        {
+          "path": "tokenizer.json",
+          "size": 2480645,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "b3c8202bbf06d8ee4232c5984baa563784ac4737e2e7fdc42fa180200d3cfcdb"
+          }
+        },
+        {
+          "path": "vocabulary.json",
+          "size": 1068114,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1"
+          }
+        }
+      ]
+    },
+    {
+      "key": "final_asr_en",
+      "purpose": "canonical English transcription",
+      "repository": "Systran/faster-whisper-large-v3",
+      "revision": "edaa852ec7e145841d8ffdb056a99866b5f0a478",
+      "license": "MIT",
+      "gated": false,
+      "files": [
+        {
+          "path": "config.json",
+          "size": 2394,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "a9306624f5ec14270a014b647e5c316b6e03a662c369758d1b90697a7b0655b9"
+          }
+        },
+        {
+          "path": "model.bin",
+          "size": 3087284237,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1"
+          }
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size": 340,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711"
+          }
+        },
+        {
+          "path": "tokenizer.json",
+          "size": 2480617,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca"
+          }
+        },
+        {
+          "path": "vocabulary.json",
+          "size": 1068114,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1"
+          }
+        }
+      ]
+    },
+    {
+      "key": "alignment_en",
+      "purpose": "WhisperX English word alignment",
+      "repository": "facebook/wav2vec2-base-960h",
+      "revision": "22aad52d435eb6dbaf354bdad9b0da84ce7d6156",
+      "license": "Apache-2.0",
+      "gated": false,
+      "files": [
+        {
+          "path": "config.json",
+          "size": 1596,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "d3ec255c063d9f95057b553b19c20135b259875834a4fe9deb218a6be25b4cf3"
+          }
+        },
+        {
+          "path": "feature_extractor_config.json",
+          "size": 158,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "d3de0c797bf9b65f90bc65c30cb7b303ebeda341f6fc80af33628c4b26b95632"
+          }
+        },
+        {
+          "path": "model.safetensors",
+          "size": 377607901,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "8aa76ab2243c81747a1f832954586bc566090c83a0ac167df6f31f0fa917d74a"
+          }
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size": 159,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "b225d617c025463b9e157e06afea8b90dc7078fc70b013c533328423e0486b4a"
+          }
+        },
+        {
+          "path": "special_tokens_map.json",
+          "size": 85,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "bb7068de1150661a10b55f9e4b12a0e77af8bf91f5e45e1b58afaf1d0e17f675"
+          }
+        },
+        {
+          "path": "tokenizer_config.json",
+          "size": 163,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "dc790594f5bc351a4311c6624f40acd95850d4aaf2a5cb3c656c9b610720b608"
+          }
+        },
+        {
+          "path": "vocab.json",
+          "size": 291,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "19727f8944fe6459fc3f240ae2c198395b740f6a029bd23e06656266b83bcf64"
+          }
+        }
+      ]
+    },
+    {
+      "key": "diarization",
+      "purpose": "exclusive and overlapping speaker diarization",
+      "repository": "pyannote/speaker-diarization-community-1",
+      "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
+      "license": "CC-BY-4.0",
+      "gated": true,
+      "files": [
+        {
+          "path": "config.yaml",
+          "size": 444,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "5ce2bfa9a938dc132cec1172592d65173cbb8f444ea1e4133f10f9391de155be"
+          }
+        },
+        {
+          "path": "embedding/pytorch_model.bin",
+          "size": 26646242,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"
+          }
+        },
+        {
+          "path": "plda/plda.npz",
+          "size": 133852,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "9b77bcd840692710dd3496f62ecfeed8d8e5f002fd991b785079b244eab7d255"
+          }
+        },
+        {
+          "path": "plda/xvec_transform.npz",
+          "size": 134376,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "325f1ce8e48f7e55e9c8aa47e05d2766b7c48c4b25b8de8dd751e7a4cc5fbe8f"
+          }
+        },
+        {
+          "path": "segmentation/pytorch_model.bin",
+          "size": 5906507,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "7ad24338d844fb95985486eb1a464e32d229f6d7a03c9abe60f978bacf3f816e"
+          }
+        }
+      ]
+    },
+    {
+      "key": "speaker_embedding",
+      "purpose": "local known-speaker embeddings",
+      "repository": "pyannote/wespeaker-voxceleb-resnet34-LM",
+      "revision": "837717ddb9ff5507820346191109dc79c958d614",
+      "license": "CC-BY-4.0",
+      "gated": false,
+      "files": [
+        {
+          "path": "config.yaml",
+          "size": 221,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "6ff718cff3c5d7a4493537ab7f4780cad7e3d32453f59099b4076aefa07a9974"
+          }
+        },
+        {
+          "path": "pytorch_model.bin",
+          "size": 26645418,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "366edf44f4c80889a3eb7a9d7bdf02c4aede3127f7dd15e274dcdb826b143c56"
+          }
+        }
+      ]
+    }
+  ]
+}
