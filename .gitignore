@@ -63,5 +63,7 @@ desktop.ini
 # QA screenshots and temporary output
 qa/
 tmp/
+.playwright-cli/
+output/
 playwright-report/
 test-results/
