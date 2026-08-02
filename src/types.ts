@@ -81,6 +81,7 @@ export interface TranscriptTurn {
 
 export interface MeetingSpeaker {
   id: string;
+  label?: string;
   displayName: string;
   color: string;
   initials: string;
@@ -97,6 +98,13 @@ export interface VoiceProfile {
   sampleCount: number;
   lastUsedAt: string;
   status: "ready" | "needs_samples";
+}
+
+export interface RenameSpeakerResult {
+  speaker: MeetingSpeaker;
+  profile?: VoiceProfile;
+  profileCreated: boolean;
+  sampleSaved: boolean;
 }
 
 export interface ProcessingJob {

@@ -15,6 +15,7 @@ import type {
   RecordingLevels,
   RecordingSession,
   RecordingStatus,
+  RenameSpeakerResult,
   TranscriptTurn,
   VoiceProfile,
   WorkerHealthEvent,
@@ -122,7 +123,7 @@ export interface CommandMap {
   };
   rename_speaker: {
     args: { meetingId: string; speakerId: string; displayName: string };
-    result: void;
+    result: RenameSpeakerResult;
   };
   merge_speakers: {
     args: {

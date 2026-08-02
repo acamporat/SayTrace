@@ -172,8 +172,8 @@ export function VoiceProfilesView({
             {expanded === profile.id ? (
               <div className="profile-list__expanded">
                 <span>
-                  <Mic2 size={17} /> Profiles require at least 30 seconds from
-                  three separate clean samples.
+                  <Mic2 size={17} /> Profiles become ready after at least 10
+                  seconds of clean, user-confirmed speech.
                 </span>
                 <button
                   type="button"
@@ -197,8 +197,8 @@ export function VoiceProfilesView({
       <div className="profile-note">
         <Info size={18} />
         <p>
-          Automatic matches never retrain a profile. A voice sample is saved
-          only after you explicitly confirm it.
+          Automatic matches never retrain a profile. Clean voice samples are
+          saved when you confirm a speaker or rename an unknown speaker.
         </p>
       </div>
     </main>

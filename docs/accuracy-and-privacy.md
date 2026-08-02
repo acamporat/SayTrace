@@ -7,7 +7,7 @@ The product favors precision over coverage:
 - Diarization clusters remain anonymous and immutable internally.
 - A known name is accepted only after configured absolute-score and
   runner-up-margin gates for the pinned embedding model and source type.
-- A usable profile requires at least 30 seconds of clean non-overlapping speech from at least three samples.
+- A usable profile requires at least 10 seconds of clean non-overlapping speech from a user-confirmed sample. Renaming an unknown speaker counts as that explicit confirmation.
 - Automatic matches never update a profile.
 - Uncertain or short clusters remain `Unknown`.
 - Similarity values are not displayed as probabilities.

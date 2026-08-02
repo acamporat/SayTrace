@@ -168,11 +168,11 @@ pub fn rename_speaker(
     speaker_id: String,
     display_name: String,
     state: State<'_, AppState>,
-) -> CommandResult<()> {
+) -> CommandResult<RenameSpeakerResult> {
     ensure_speaker_in_meeting(&state, &meeting_id, &speaker_id)?;
     state
         .core
-        .rename_speaker(&speaker_id, display_name)
+        .rename_speaker(&meeting_id, &speaker_id, display_name)
         .map_err(ApiError::from)
 }
 

@@ -204,6 +204,43 @@ describe("SayTrace workspace", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Speaker renamed.")).toBeInTheDocument();
   });
+
+  it("highlights the corresponding speaker card when a transcript turn is selected", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(screen.getByText(/One thing to note/));
+
+    expect(
+      screen.getByText("Speaker 3", { selector: ".speaker-card.is-selected strong" }),
+    ).toBeInTheDocument();
+  });
+
+  it("automatically creates a voice profile when an unknown speaker is renamed", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      screen.getByRole("button", { name: "More actions for Speaker 3" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Rename speaker" }));
+    const name = screen.getByRole("textbox", { name: "Speaker name" });
+    await user.clear(name);
+    await user.type(name, "Taylor Reed");
+    await user.tab();
+
+    expect(
+      screen.getByText("Speaker renamed and voice profile updated automatically."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Taylor Reed", { selector: ".speaker-card strong" }),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Voice profiles" }));
+    const taylorProfile = screen.getByText("Taylor Reed").closest("article");
+    expect(taylorProfile).not.toBeNull();
+    expect(within(taylorProfile!).getByText("Ready to match")).toBeInTheDocument();
+  });
 });
 
 describe("Model setup", () => {

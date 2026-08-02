@@ -76,6 +76,15 @@ pub struct MeetingSpeaker {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RenameSpeakerResult {
+    pub speaker: MeetingSpeaker,
+    pub profile: Option<VoiceProfile>,
+    pub profile_created: bool,
+    pub sample_saved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WordTiming {
     pub id: String,
     pub turn_id: String,

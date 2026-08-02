@@ -14,6 +14,9 @@ from typing import Any
 from .errors import ErrorCode, WorkerError
 from .schema import JsonObject, require_string
 
+MIN_PROFILE_SAMPLES = 1
+MIN_PROFILE_CLEAN_DURATION_MS = 10_000
+
 
 @dataclass(frozen=True, slots=True)
 class VoiceProfile:
@@ -59,8 +62,8 @@ class VoiceProfile:
     def eligible(self) -> bool:
         return (
             self.explicitly_confirmed
-            and len(self.embeddings) >= 3
-            and sum(self.sample_durations_ms) >= 30_000
+            and len(self.embeddings) >= MIN_PROFILE_SAMPLES
+            and sum(self.sample_durations_ms) >= MIN_PROFILE_CLEAN_DURATION_MS
             and all(duration > 0 for duration in self.sample_durations_ms)
         )
 

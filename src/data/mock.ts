@@ -6,7 +6,24 @@ import type {
   ModelPackStatus,
   TranscriptTurn,
   VoiceProfile,
+  WordTiming,
 } from "../types";
+
+function evenlyTimedWords(
+  turnId: string,
+  text: string,
+  startMs: number,
+  endMs: number,
+): WordTiming[] {
+  const tokens = text.match(/\S+/g) ?? [];
+  const wordDuration = (endMs - startMs) / Math.max(1, tokens.length);
+  return tokens.map((token, index) => ({
+    id: `${turnId}-word-${index + 1}`,
+    text: token,
+    startMs: Math.round(startMs + wordDuration * index),
+    endMs: Math.round(startMs + wordDuration * (index + 1)),
+  }));
+}
 
 export const meetings: Meeting[] = [
   {
@@ -80,9 +97,10 @@ export const speakers: MeetingSpeaker[] = [
   },
   {
     id: "unknown",
-    displayName: "Unknown speaker",
+    label: "SPEAKER_02",
+    displayName: "Speaker 3",
     color: "#676c72",
-    initials: "U",
+    initials: "S3",
     state: "Review",
     profileId: "profile-sam",
   },
@@ -119,6 +137,12 @@ export const transcriptTurns: TranscriptTurn[] = [
     endMs: 231_000,
     modelText:
       "Early results look promising. Activation is up 12% and drop-off decreased by 8%. We’ll share the full report later this week.",
+    words: evenlyTimedWords(
+      "turn-4",
+      "Early results look promising. Activation is up 12% and drop-off decreased by 8%. We’ll share the full report later this week.",
+      180_000,
+      231_000,
+    ),
     isMarked: true,
   },
   {

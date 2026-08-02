@@ -31,6 +31,10 @@ import {
   isDraftRevisionEvent,
   upsertDraftSpeaker,
 } from "./lib/liveDraft";
+import {
+  defaultUnknownSpeakerName,
+  normalizeUnknownSpeakerNames,
+} from "./lib/speakers";
 import type {
   AudioDevice,
   AppStatus,
@@ -49,6 +53,7 @@ import type {
 } from "./types";
 
 type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
+const PROFILE_READY_DURATION_MS = 10_000;
 
 function safeMeetingStatus(
   meeting: Meeting,
@@ -73,7 +78,7 @@ function normalizeMeeting(meeting: Meeting): Meeting {
 
 function normalizeSpeakers(raw: MeetingSpeaker[]): MeetingSpeaker[] {
   const colors = ["#3aa66f", "#8052ca", "#169c9d", "#d57b26"];
-  return raw.map((speaker, index) => ({
+  return normalizeUnknownSpeakerNames(raw).map((speaker, index) => ({
     ...speaker,
     color: speaker.color || colors[index % colors.length],
     initials:
@@ -108,7 +113,7 @@ function transcriptText(
   const lines = turns.map((turn) => {
     const speaker =
       speakers.find((candidate) => candidate.id === turn.speakerId)?.displayName ??
-      "Unknown speaker";
+      "Speaker 1";
     return `${speaker}: ${turn.editedText ?? turn.modelText}`;
   });
   if (format === "md") return `# ${title}\n\n${lines.join("\n\n")}\n`;
@@ -840,6 +845,9 @@ export default function App() {
 
   function renameSpeaker(speakerId: string, name: string) {
     const previousSpeaker = speakers.find((speaker) => speaker.id === speakerId);
+    if (!previousSpeaker) return;
+    const shouldSaveProfile =
+      previousSpeaker.state !== "Matched" || !previousSpeaker.profileId;
     setSpeakers((current) =>
       current.map((speaker) =>
         speaker.id === speakerId
@@ -861,22 +869,91 @@ export default function App() {
         speakerId,
         displayName: name,
       })
-        .then(() => notify("Speaker renamed."))
-        .catch(() => {
-          if (previousSpeaker) {
-            setSpeakers((current) =>
-              current.map((speaker) =>
-                speaker.id === speakerId && speaker.displayName === name
-                  ? previousSpeaker
-                  : speaker,
-              ),
-            );
+        .then((result) => {
+          const savedSpeaker = normalizeSpeakers([result.speaker])[0];
+          setSpeakers((current) =>
+            current.map((speaker) =>
+              speaker.id === speakerId ? savedSpeaker : speaker,
+            ),
+          );
+          if (result.profile) {
+            setProfiles((current) => [
+              result.profile!,
+              ...current.filter((profile) => profile.id !== result.profile!.id),
+            ]);
           }
+          notify(
+            result.profile
+              ? result.sampleSaved
+                ? "Speaker renamed and voice profile updated automatically."
+                : "Speaker renamed and voice profile saved; no clean sample was available yet."
+              : "Speaker renamed.",
+            result.profile && !result.sampleSaved ? "info" : "success",
+          );
+        })
+        .catch(() => {
+          setSpeakers((current) =>
+            current.map((speaker) =>
+              speaker.id === speakerId && speaker.displayName === name
+                ? previousSpeaker
+                : speaker,
+            ),
+          );
           notify("The speaker name could not be saved.", "warning");
         });
       return;
     }
-    notify("Speaker renamed.");
+    if (!shouldSaveProfile) {
+      notify("Speaker renamed.");
+      return;
+    }
+    const existingProfile = profiles.find(
+      (profile) => profile.name.trim().toLocaleLowerCase() === name.toLocaleLowerCase(),
+    );
+    const profile: VoiceProfile = existingProfile
+      ? {
+          ...existingProfile,
+          sampleDurationMs: existingProfile.sampleDurationMs + 12_000,
+          sampleCount: existingProfile.sampleCount + 1,
+          lastUsedAt: new Date().toISOString(),
+          status:
+            existingProfile.sampleDurationMs + 12_000 >=
+            PROFILE_READY_DURATION_MS
+              ? "ready"
+              : "needs_samples",
+        }
+      : {
+          id: `profile-${Date.now()}`,
+          name,
+          initials: name
+            .split(/\s+/)
+            .slice(0, 2)
+            .map((part) => part[0]?.toUpperCase())
+            .join(""),
+          color: previousSpeaker.color,
+          sampleDurationMs: 12_000,
+          sampleCount: 1,
+          lastUsedAt: new Date().toISOString(),
+          status: 12_000 >= PROFILE_READY_DURATION_MS ? "ready" : "needs_samples",
+        };
+    setProfiles((current) => [
+      profile,
+      ...current.filter((candidate) => candidate.id !== profile.id),
+    ]);
+    setSpeakers((current) =>
+      current.map((speaker) =>
+        speaker.id === speakerId
+          ? {
+              ...speaker,
+              displayName: name,
+              initials: profile.initials,
+              profileId: profile.id,
+              state: "Matched",
+            }
+          : speaker,
+      ),
+    );
+    notify("Speaker renamed and voice profile updated automatically.");
   }
 
   function mergeSpeaker(sourceSpeakerId: string, targetSpeakerId: string) {
@@ -922,6 +999,10 @@ export default function App() {
   function reviewSpeaker(speakerId: string, accepted: boolean) {
     const previousSpeaker = speakers.find((speaker) => speaker.id === speakerId);
     if (!previousSpeaker) return;
+    const defaultSpeakerName = defaultUnknownSpeakerName(
+      previousSpeaker.label,
+      Math.max(1, speakers.findIndex((speaker) => speaker.id === speakerId) + 1),
+    );
     const matchedProfile = previousSpeaker.profileId
       ? profiles.find((profile) => profile.id === previousSpeaker.profileId)
       : undefined;
@@ -942,9 +1023,9 @@ export default function App() {
             : {
                 ...speaker,
                 state: "Unknown",
-                displayName: "Unknown speaker",
+                displayName: defaultSpeakerName,
                 profileId: undefined,
-                initials: "U",
+                initials: `S${defaultSpeakerName.replace(/\D/g, "")}`,
               }
           : speaker,
       ),
@@ -966,7 +1047,7 @@ export default function App() {
     notify(
       accepted
         ? `Speaker matched to ${matchedProfile?.name}.`
-        : "Match removed. This speaker will remain Unknown.",
+        : `Match removed. This speaker will remain ${defaultSpeakerName}.`,
       "info",
     );
   }
@@ -1004,17 +1085,20 @@ export default function App() {
       current.filter((profile) => profile.id !== profileId),
     );
     setSpeakers((current) =>
-      current.map((speaker) =>
-        speaker.profileId === profileId
-          ? {
-              ...speaker,
-              displayName: "Unknown speaker",
-              initials: "U",
-              profileId: undefined,
-              state: "Unknown",
-            }
-          : speaker,
-      ),
+      current.map((speaker, index) => {
+        if (speaker.profileId !== profileId) return speaker;
+        const displayName = defaultUnknownSpeakerName(
+          speaker.label,
+          index + 1,
+        );
+        return {
+          ...speaker,
+          displayName,
+          initials: `S${displayName.replace(/\D/g, "")}`,
+          profileId: undefined,
+          state: "Unknown",
+        };
+      }),
     );
     if (desktopRuntime) {
       void invokeCommand("delete_voice_profile", { profileId })
@@ -1041,7 +1125,7 @@ export default function App() {
           name,
         });
         setProfiles((current) => [created, ...current]);
-        notify("Voice profile created. Add three clean samples to enable matching.");
+        notify("Voice profile created. Add at least 10 seconds of clean speech to enable matching.");
         return created;
       } catch (error) {
         notify(
@@ -1066,7 +1150,7 @@ export default function App() {
       status: "needs_samples",
     };
     setProfiles((current) => [created, ...current]);
-    notify("Voice profile created. Add three clean samples to enable matching.");
+    notify("Voice profile created. Add at least 10 seconds of clean speech to enable matching.");
     return created;
   }
 
@@ -1122,8 +1206,8 @@ export default function App() {
             sampleCount: profile.sampleCount + 1,
             lastUsedAt: new Date().toISOString(),
             status:
-              profile.sampleCount + 1 >= 3 &&
-              profile.sampleDurationMs + 12_000 >= 30_000
+              profile.sampleDurationMs + 12_000 >=
+              PROFILE_READY_DURATION_MS
                 ? ("ready" as const)
                 : ("needs_samples" as const),
           };

@@ -11,6 +11,8 @@ interface TranscriptRowsProps {
   editable?: boolean;
   selectedTurnId?: string;
   activeTurnId?: string;
+  activeWordId?: string;
+  playbackPositionMs?: number;
   onSelectTurn?: (turnId: string) => void;
   onEdit?: (turnId: string, editedText: string) => void;
   onToggleMarker?: (turnId: string) => void;
@@ -31,6 +33,119 @@ function HighlightedText({ text, query }: { text: string; query?: string }) {
   );
 }
 
+function HighlightedSlice({
+  text,
+  offset,
+  highlightStart,
+  highlightEnd,
+}: {
+  text: string;
+  offset: number;
+  highlightStart: number;
+  highlightEnd: number;
+}) {
+  const localStart = Math.max(0, highlightStart - offset);
+  const localEnd = Math.min(text.length, highlightEnd - offset);
+  if (localStart >= localEnd) return text;
+  return (
+    <>
+      {text.slice(0, localStart)}
+      <mark>{text.slice(localStart, localEnd)}</mark>
+      {text.slice(localEnd)}
+    </>
+  );
+}
+
+function TimedTranscriptText({
+  text,
+  query,
+  words,
+  activeWordId,
+  playbackPositionMs,
+}: {
+  text: string;
+  query?: string;
+  words: TranscriptTurn["words"];
+  activeWordId?: string;
+  playbackPositionMs?: number;
+}) {
+  if (!words?.length) return <HighlightedText text={text} query={query} />;
+
+  const lowerText = text.toLocaleLowerCase();
+  const parts: Array<{
+    key: string;
+    text: string;
+    start: number;
+    word?: NonNullable<TranscriptTurn["words"]>[number];
+  }> = [];
+  const term = query?.trim() ?? "";
+  const highlightStart = term
+    ? lowerText.indexOf(term.toLocaleLowerCase())
+    : -1;
+  const highlightEnd = highlightStart < 0 ? -1 : highlightStart + term.length;
+  let cursor = 0;
+
+  for (const word of words) {
+    const token = word.text.trim();
+    if (!token) continue;
+    const start = lowerText.indexOf(token.toLocaleLowerCase(), cursor);
+    if (start < 0) return <HighlightedText text={text} query={query} />;
+    if (start > cursor) {
+      parts.push({
+        key: `gap-${word.id}`,
+        text: text.slice(cursor, start),
+        start: cursor,
+      });
+    }
+    const end = start + token.length;
+    parts.push({ key: word.id, text: text.slice(start, end), start, word });
+    cursor = end;
+  }
+
+  if (cursor < text.length) {
+    parts.push({ key: "tail", text: text.slice(cursor), start: cursor });
+  }
+
+  return (
+    <>
+      {parts.map((part) => {
+        if (!part.word) {
+          return (
+            <HighlightedSlice
+              key={part.key}
+              text={part.text}
+              offset={part.start}
+              highlightStart={highlightStart}
+              highlightEnd={highlightEnd}
+            />
+          );
+        }
+        const isCurrent = part.word.id === activeWordId;
+        const isPlayed =
+          playbackPositionMs !== undefined &&
+          part.word.endMs <= playbackPositionMs;
+        return (
+          <span
+            key={part.key}
+            className={`transcript-word${isPlayed ? " is-played" : ""}${
+              isCurrent ? " is-current" : ""
+            }`}
+            data-word-id={part.word.id}
+            data-playback-current={isCurrent ? "true" : undefined}
+          >
+            <HighlightedSlice
+              text={part.text}
+              offset={part.start}
+              highlightStart={highlightStart}
+              highlightEnd={highlightEnd}
+            />
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
 export function TranscriptRows({
   turns,
   speakers,
@@ -38,6 +153,8 @@ export function TranscriptRows({
   editable = false,
   selectedTurnId,
   activeTurnId,
+  activeWordId,
+  playbackPositionMs,
   onSelectTurn,
   onEdit,
   onToggleMarker,
@@ -57,12 +174,16 @@ export function TranscriptRows({
                 ? "You"
                 : turn.speakerId
                   ? `Speaker ${turn.speakerId.replace(/\D/g, "") || ""}`.trim()
-                  : "Unknown speaker",
+                  : "Speaker 1",
             initials: turn.speakerId === "you" ? "Y" : "U",
             color: turn.speakerId === "you" ? "#0868df" : "#676c72",
             state: "Unknown" as const,
           };
         const displayText = turn.editedText ?? turn.modelText;
+        const alignedWords =
+          turn.editedText === undefined || turn.editedText === turn.modelText
+            ? turn.words
+            : undefined;
         return (
           <article
             key={turn.id}
@@ -92,11 +213,23 @@ export function TranscriptRows({
                     onEdit?.(turn.id, event.currentTarget.textContent ?? "")
                   }
                 >
-                  <HighlightedText text={displayText} query={search} />
+                  <TimedTranscriptText
+                    text={displayText}
+                    query={search}
+                    words={alignedWords}
+                    activeWordId={activeWordId}
+                    playbackPositionMs={playbackPositionMs}
+                  />
                 </div>
               ) : (
                 <p>
-                  <HighlightedText text={displayText} query={search} />
+                  <TimedTranscriptText
+                    text={displayText}
+                    query={search}
+                    words={alignedWords}
+                    activeWordId={activeWordId}
+                    playbackPositionMs={playbackPositionMs}
+                  />
                   {turn.isDraft &&
                   turn.id === turns[turns.length - 1]?.id ? (
                     <span className="draft-ellipsis" aria-label="Caption updating">

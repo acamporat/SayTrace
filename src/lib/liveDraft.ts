@@ -3,6 +3,7 @@ import type {
   MeetingSpeaker,
   TranscriptTurn,
 } from "../types";
+import { defaultUnknownSpeakerName } from "./speakers";
 
 const DRAFT_WINDOW_MS = 25_000;
 const SPEAKER_COLORS = ["#0868df", "#8052ca", "#169c9d", "#d57b26"];
@@ -53,7 +54,15 @@ export function upsertDraftSpeaker(
   const id = draftSpeakerId(event);
   if (speakers.some((speaker) => speaker.id === id)) return speakers;
   const hint = event.speaker_hint.trim();
-  const displayName = id === "you" ? "You" : hint || "Unknown speaker";
+  const isAnonymousHint = /^(?:unknown(?: speaker)?|speaker)$/i.test(hint);
+  const displayName =
+    id === "you"
+      ? "You"
+      : (hint && !isAnonymousHint ? hint : undefined) ||
+        defaultUnknownSpeakerName(
+          undefined,
+          speakers.filter((speaker) => speaker.state === "Unknown").length + 1,
+        );
   const initials =
     id === "you"
       ? "Y"

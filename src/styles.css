@@ -859,6 +859,24 @@ button:disabled {
   line-height: 1.44;
 }
 
+.transcript-word {
+  border-radius: 3px;
+  transition:
+    color 100ms ease,
+    background-color 100ms ease;
+}
+
+.transcript-word.is-played {
+  color: #075fc8;
+}
+
+.transcript-word.is-current {
+  padding: 1px 2px;
+  margin: -1px -2px;
+  color: #fff;
+  background: #0868df;
+}
+
 .transcript-row__editor {
   min-height: 24px;
   cursor: text;
@@ -980,6 +998,12 @@ button:disabled {
   border-radius: 7px;
   background: #fff;
   min-height: 116px;
+}
+
+.speaker-card.is-selected {
+  border-color: #78abe5;
+  background: #f0f7ff;
+  box-shadow: inset 3px 0 0 #0868df;
 }
 
 .speaker-card__topline {

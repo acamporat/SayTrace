@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -25,6 +25,8 @@ const DEFAULT_PROFILE_COLORS: &[&str] = &[
 ];
 const MAX_ASSET_CHUNK: u32 = 4 * 1024 * 1024;
 const MODEL_MANIFEST_JSON: &str = include_str!("../../worker/model-manifest.json");
+pub(crate) const VOICE_PROFILE_MIN_SAMPLES: i64 = 1;
+pub(crate) const VOICE_PROFILE_MIN_CLEAN_DURATION_MS: i64 = 10_000;
 
 #[derive(Debug, Deserialize)]
 struct BundledModelManifest {
@@ -328,9 +330,10 @@ impl CoreService {
                     needs_review,color
              FROM meeting_speakers WHERE meeting_id=?1 ORDER BY cluster_label",
         )?;
-        let speakers = speaker_statement
+        let mut speakers = speaker_statement
             .query_map([meeting_id], map_speaker)?
             .collect::<Result<Vec<_>, _>>()?;
+        normalize_unknown_speaker_names(&mut speakers);
 
         let mut turn_statement = connection.prepare(
             "SELECT id,meeting_id,speaker_id,start_ms,end_ms,model_text,edited_text,
@@ -602,18 +605,134 @@ impl CoreService {
         self.get_turn(turn_id)
     }
 
-    pub fn rename_speaker(&self, speaker_id: &str, display_name: String) -> CoreResult<()> {
+    pub fn rename_speaker(
+        &self,
+        meeting_id: &str,
+        speaker_id: &str,
+        display_name: String,
+    ) -> CoreResult<RenameSpeakerResult> {
+        validate_id(meeting_id, "meeting")?;
         validate_id(speaker_id, "speaker")?;
         let name = nonempty_name(display_name, "speaker name")?;
-        let connection = self.database.connect()?;
-        let updated = connection.execute(
-            "UPDATE meeting_speakers SET display_name=?1 WHERE id=?2",
-            params![name, speaker_id],
-        )?;
-        if updated == 0 {
-            return Err(CoreError::NotFound(format!("speaker {speaker_id}")));
+        let now = now_ms();
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction()?;
+        let (match_state, current_profile_id): (String, Option<String>) = transaction
+            .query_row(
+                "SELECT match_state,profile_id FROM meeting_speakers
+                 WHERE id=?1 AND meeting_id=?2",
+                params![speaker_id, meeting_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::NotFound(format!("speaker {speaker_id}")))?;
+
+        let should_save_profile = match_state != "matched" || current_profile_id.is_none();
+        let mut profile_id = current_profile_id;
+        let mut profile_created = false;
+        let mut sample_saved = false;
+
+        if should_save_profile {
+            profile_id = transaction
+                .query_row(
+                    "SELECT id FROM voice_profiles
+                     WHERE trim(display_name)=?1 COLLATE NOCASE
+                     ORDER BY created_at_ms,id LIMIT 1",
+                    [&name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if profile_id.is_none() {
+                let id = new_id();
+                transaction.execute(
+                    "INSERT INTO voice_profiles(
+                        id,display_name,color,created_at_ms,updated_at_ms,last_used_at_ms
+                     ) VALUES (?1,?2,?3,?4,?4,?4)",
+                    params![id, name, color_for(&id), now],
+                )?;
+                profile_id = Some(id);
+                profile_created = true;
+            }
+            let saved_profile_id = profile_id
+                .as_deref()
+                .ok_or_else(|| CoreError::NotFound("automatic voice profile".into()))?;
+            let candidate: Option<(i64, Vec<u8>)> = transaction
+                .query_row(
+                    "SELECT clean_duration_ms,encrypted_embedding
+                     FROM voice_profile_candidates
+                     WHERE meeting_id=?1 AND speaker_id=?2",
+                    params![meeting_id, speaker_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((clean_duration_ms, protected)) = candidate {
+                transaction.execute(
+                    "INSERT INTO voice_profile_samples(
+                        id,profile_id,meeting_id,speaker_id,clean_duration_ms,
+                        encrypted_embedding,confirmed_at_ms
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(profile_id,meeting_id,speaker_id) DO UPDATE SET
+                        clean_duration_ms=excluded.clean_duration_ms,
+                        encrypted_embedding=excluded.encrypted_embedding,
+                        confirmed_at_ms=excluded.confirmed_at_ms",
+                    params![
+                        new_id(),
+                        saved_profile_id,
+                        meeting_id,
+                        speaker_id,
+                        clean_duration_ms,
+                        protected,
+                        now
+                    ],
+                )?;
+                transaction.execute(
+                    "DELETE FROM voice_profile_candidates
+                     WHERE meeting_id=?1 AND speaker_id=?2",
+                    params![meeting_id, speaker_id],
+                )?;
+                sample_saved = true;
+            }
+            transaction.execute(
+                "UPDATE voice_profiles SET updated_at_ms=?1,last_used_at_ms=?1 WHERE id=?2",
+                params![now, saved_profile_id],
+            )?;
+            transaction.execute(
+                "UPDATE meeting_speakers
+                 SET display_name=?1,profile_id=?2,match_state='matched',needs_review=0
+                 WHERE id=?3 AND meeting_id=?4",
+                params![name, saved_profile_id, speaker_id, meeting_id],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE meeting_speakers SET display_name=?1
+                 WHERE id=?2 AND meeting_id=?3",
+                params![name, speaker_id, meeting_id],
+            )?;
         }
-        Ok(())
+        transaction.commit()?;
+
+        let speaker = self
+            .get_meeting(meeting_id)?
+            .speakers
+            .into_iter()
+            .find(|speaker| speaker.id == speaker_id)
+            .ok_or_else(|| CoreError::NotFound(format!("speaker {speaker_id}")))?;
+        let profile = if should_save_profile {
+            let saved_profile_id = profile_id
+                .as_deref()
+                .ok_or_else(|| CoreError::NotFound("automatic voice profile".into()))?;
+            self.list_voice_profiles()?
+                .into_iter()
+                .find(|profile| profile.id == saved_profile_id)
+        } else {
+            None
+        };
+        Ok(RenameSpeakerResult {
+            speaker,
+            profile,
+            profile_created,
+            sample_saved,
+        })
     }
 
     pub fn merge_speakers(
@@ -726,12 +845,21 @@ impl CoreService {
                 [speaker_id],
             )?
         } else {
+            let cluster_label = connection
+                .query_row(
+                    "SELECT cluster_label FROM meeting_speakers WHERE id=?1",
+                    [speaker_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| CoreError::NotFound(format!("speaker {speaker_id}")))?;
+            let default_name = default_unknown_speaker_name(&cluster_label);
             connection.execute(
                 "UPDATE meeting_speakers
-                 SET profile_id=NULL,display_name='Unknown speaker',
+                 SET profile_id=NULL,display_name=?1,
                      match_state='unknown',needs_review=1
-                 WHERE id=?1",
-                [speaker_id],
+                 WHERE id=?2",
+                params![default_name, speaker_id],
             )?
         };
         if updated == 0 {
@@ -785,7 +913,8 @@ impl CoreService {
                 let last_used: Option<i64> = row.get(5)?;
                 let sample_count = row.get::<_, i64>(6)? as u32;
                 let duration: i64 = row.get(7)?;
-                let ready = sample_count >= 3 && duration >= 30_000;
+                let ready = sample_count as i64 >= VOICE_PROFILE_MIN_SAMPLES
+                    && duration >= VOICE_PROFILE_MIN_CLEAN_DURATION_MS;
                 Ok(VoiceProfile {
                     id,
                     name: name.clone(),
@@ -828,13 +957,24 @@ impl CoreService {
         validate_id(profile_id, "voice profile")?;
         let mut connection = self.database.connect()?;
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "UPDATE meeting_speakers
-             SET profile_id=NULL,display_name='Unknown speaker',
-                 match_state='unknown',needs_review=1
-             WHERE profile_id=?1",
-            [profile_id],
-        )?;
+        let affected_speakers = {
+            let mut statement = transaction
+                .prepare("SELECT id,cluster_label FROM meeting_speakers WHERE profile_id=?1")?;
+            let speakers = statement
+                .query_map([profile_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            speakers
+        };
+        for (speaker_id, cluster_label) in affected_speakers {
+            transaction.execute(
+                "UPDATE meeting_speakers
+                 SET profile_id=NULL,display_name=?1,match_state='unknown',needs_review=1
+                 WHERE id=?2",
+                params![default_unknown_speaker_name(&cluster_label), speaker_id],
+            )?;
+        }
         let deleted =
             transaction.execute("DELETE FROM voice_profiles WHERE id=?1", [profile_id])?;
         if deleted == 0 {
@@ -1436,16 +1576,26 @@ fn map_asset(row: &Row<'_>) -> rusqlite::Result<MediaAsset> {
 
 fn map_speaker(row: &Row<'_>) -> rusqlite::Result<MeetingSpeaker> {
     let id: String = row.get(0)?;
-    let name: String = row.get(3)?;
+    let label: String = row.get(2)?;
+    let stored_name: String = row.get(3)?;
     let state = match row.get::<_, String>(5)?.as_str() {
         "matched" => SpeakerMatchState::Matched,
         "review" => SpeakerMatchState::Review,
         _ => SpeakerMatchState::Unknown,
     };
+    let name = if matches!(
+        state,
+        SpeakerMatchState::Unknown | SpeakerMatchState::Review
+    ) && matches!(stored_name.trim(), "Unknown" | "Unknown speaker")
+    {
+        default_unknown_speaker_name(&label)
+    } else {
+        stored_name
+    };
     Ok(MeetingSpeaker {
         id: id.clone(),
         meeting_id: row.get(1)?,
-        label: row.get(2)?,
+        label,
         display_name: name.clone(),
         initials: initials(&name),
         profile_id: row.get(4)?,
@@ -1457,6 +1607,74 @@ fn map_speaker(row: &Row<'_>) -> rusqlite::Result<MeetingSpeaker> {
                 .unwrap_or_else(|| color_for(&id)),
         ),
     })
+}
+
+fn normalize_unknown_speaker_names(speakers: &mut [MeetingSpeaker]) {
+    let anonymous = speakers
+        .iter()
+        .map(|speaker| {
+            matches!(
+                speaker.state,
+                SpeakerMatchState::Unknown | SpeakerMatchState::Review
+            ) && (matches!(speaker.display_name.trim(), "Unknown" | "Unknown speaker")
+                || numbered_unknown_name(&speaker.display_name).is_some())
+        })
+        .collect::<Vec<_>>();
+    let mut used = speakers
+        .iter()
+        .zip(&anonymous)
+        .filter_map(|(speaker, anonymous)| {
+            (!anonymous).then(|| numbered_unknown_name(&speaker.display_name))?
+        })
+        .collect::<BTreeSet<_>>();
+    let mut assignments = vec![None; speakers.len()];
+
+    for (index, speaker) in speakers.iter().enumerate() {
+        if !anonymous[index] {
+            continue;
+        }
+        if let Some(preferred) = number_from_cluster_label(&speaker.label) {
+            if used.insert(preferred) {
+                assignments[index] = Some(preferred);
+            }
+        }
+    }
+    for (index, speaker) in speakers.iter().enumerate() {
+        if !anonymous[index] || assignments[index].is_some() {
+            continue;
+        }
+        if let Some(current) = numbered_unknown_name(&speaker.display_name) {
+            if used.insert(current) {
+                assignments[index] = Some(current);
+            }
+        }
+    }
+
+    let mut fallback = 1;
+    for (index, speaker) in speakers.iter_mut().enumerate() {
+        if !anonymous[index] {
+            continue;
+        }
+        let number = assignments[index].unwrap_or_else(|| {
+            while used.contains(&fallback) {
+                fallback += 1;
+            }
+            let number = fallback;
+            used.insert(number);
+            number
+        });
+        speaker.display_name = format!("Speaker {number}");
+        speaker.initials = format!("S{number}");
+    }
+}
+
+fn numbered_unknown_name(display_name: &str) -> Option<u32> {
+    display_name
+        .trim()
+        .strip_prefix("Speaker ")?
+        .parse::<u32>()
+        .ok()
+        .filter(|number| *number > 0)
 }
 
 fn map_turn_without_words(row: &Row<'_>) -> rusqlite::Result<TranscriptTurn> {
@@ -1690,6 +1908,28 @@ fn nonempty_name(value: String, label: &str) -> CoreResult<String> {
         )));
     }
     Ok(value.into())
+}
+
+fn default_unknown_speaker_name(cluster_label: &str) -> String {
+    format!(
+        "Speaker {}",
+        number_from_cluster_label(cluster_label).unwrap_or(1)
+    )
+}
+
+fn number_from_cluster_label(cluster_label: &str) -> Option<u32> {
+    let trailing_digits = cluster_label
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    trailing_digits
+        .parse::<u32>()
+        .ok()
+        .and_then(|value| value.checked_add(1))
 }
 
 fn initials(name: &str) -> String {
@@ -2118,6 +2358,100 @@ mod tests {
     }
 
     #[test]
+    fn renaming_an_unknown_speaker_automatically_saves_its_voice_profile() {
+        let (_temp, service) = service();
+        let connection = service.database.connect().unwrap();
+        let now = now_ms();
+        let meeting_id = new_id();
+        let speaker_id = new_id();
+        connection
+            .execute(
+                "INSERT INTO meetings(id,title,source_kind,status,created_at_ms)
+                 VALUES (?1,'Test','import','ready',?2)",
+                params![meeting_id, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO meeting_speakers(
+                    id,meeting_id,cluster_label,display_name,match_state,needs_review
+                 ) VALUES (?1,?2,'SPEAKER_01','Speaker 2','unknown',1)",
+                params![speaker_id, meeting_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO voice_profile_candidates(
+                    id,meeting_id,speaker_id,cluster_label,clean_duration_ms,
+                    encrypted_embedding,pipeline_version,created_at_ms
+                 ) VALUES (?1,?2,?3,'SPEAKER_01',12000,?4,?5,?6)",
+                params![
+                    new_id(),
+                    meeting_id,
+                    speaker_id,
+                    vec![1_u8, 2, 3, 4],
+                    crate::worker::PIPELINE_VERSION,
+                    now
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let result = service
+            .rename_speaker(&meeting_id, &speaker_id, "Jordan Lee".into())
+            .unwrap();
+
+        assert!(result.profile_created);
+        assert!(result.sample_saved);
+        assert_eq!(result.speaker.display_name, "Jordan Lee");
+        assert_eq!(result.speaker.match_state, SpeakerMatchState::Matched);
+        let profile = result.profile.unwrap();
+        assert_eq!(profile.name, "Jordan Lee");
+        assert_eq!(profile.sample_count, 1);
+        assert_eq!(profile.sample_duration_ms, 12_000);
+        assert!(profile.ready_for_matching);
+    }
+
+    #[test]
+    fn legacy_unknown_labels_receive_unique_numbered_names() {
+        let (_temp, service) = service();
+        let connection = service.database.connect().unwrap();
+        let now = now_ms();
+        let meeting_id = new_id();
+        connection
+            .execute(
+                "INSERT INTO meetings(id,title,source_kind,status,created_at_ms)
+                 VALUES (?1,'Legacy speakers','import','ready',?2)",
+                params![meeting_id, now],
+            )
+            .unwrap();
+        for (label, name) in [
+            ("SPEAKER_00", "Unknown"),
+            ("SPEAKER_01", "Unknown speaker"),
+            ("unknown", "Unknown"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO meeting_speakers(
+                        id,meeting_id,cluster_label,display_name,match_state,needs_review
+                     ) VALUES (?1,?2,?3,?4,'unknown',1)",
+                    params![new_id(), meeting_id, label, name],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let names = service
+            .get_meeting(&meeting_id)
+            .unwrap()
+            .speakers
+            .into_iter()
+            .map(|speaker| speaker.display_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Speaker 1", "Speaker 2", "Speaker 3"]);
+    }
+
+    #[test]
     fn voice_confirmation_requires_an_encrypted_worker_candidate() {
         let (_temp, service) = service();
         let connection = service.database.connect().unwrap();
@@ -2196,7 +2530,7 @@ mod tests {
             .into_iter()
             .find(|speaker| speaker.id == speaker_id)
             .unwrap();
-        assert_eq!(speaker.display_name, "Unknown speaker");
+        assert_eq!(speaker.display_name, "Speaker 1");
         assert_eq!(speaker.profile_id, None);
         assert_eq!(speaker.match_state, SpeakerMatchState::Unknown);
         assert!(speaker.needs_review);
@@ -2245,7 +2579,7 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(speaker.profile_id, None);
-        assert_eq!(speaker.display_name, "Unknown speaker");
+        assert_eq!(speaker.display_name, "Speaker 1");
         assert_eq!(speaker.match_state, SpeakerMatchState::Unknown);
         assert!(speaker.needs_review);
     }

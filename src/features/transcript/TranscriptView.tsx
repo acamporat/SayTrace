@@ -92,6 +92,7 @@ function SpeakerStateBadge({ state }: { state: SpeakerState }) {
 interface SpeakerCardProps {
   speaker: MeetingSpeaker;
   allSpeakers: MeetingSpeaker[];
+  selected: boolean;
   onRename: (name: string) => void;
   onMerge: (targetId: string) => void;
   suggestedProfileName?: string;
@@ -102,6 +103,7 @@ interface SpeakerCardProps {
 function SpeakerCard({
   speaker,
   allSpeakers,
+  selected,
   onRename,
   onMerge,
   suggestedProfileName,
@@ -124,7 +126,11 @@ function SpeakerCard({
   }
 
   return (
-    <div className="speaker-card">
+    <div
+      className={`speaker-card${selected ? " is-selected" : ""}`}
+      data-speaker-id={speaker.id}
+      aria-current={selected ? "true" : undefined}
+    >
       <div className="speaker-card__topline">
         <SpeakerAvatar initials={speaker.initials} color={speaker.color} />
         {editing ? (
@@ -251,6 +257,26 @@ function SpeakerCard({
   );
 }
 
+function findActiveWordId(
+  words: Array<{ id: string; startMs: number; endMs: number }>,
+  positionMs: number,
+) {
+  let low = 0;
+  let high = words.length - 1;
+  let candidate = -1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (words[middle].startMs <= positionMs) {
+      candidate = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  const word = candidate >= 0 ? words[candidate] : undefined;
+  return word && positionMs < word.endMs ? word.id : undefined;
+}
+
 export function TranscriptView({
   meeting,
   mediaSourceUrl,
@@ -276,7 +302,9 @@ export function TranscriptView({
   const [search, setSearch] = useState("");
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(767_000);
-  const [selectedTurn, setSelectedTurn] = useState<string | undefined>("turn-4");
+  const [selectedTurn, setSelectedTurn] = useState<string | undefined>(
+    () => turns[0]?.id,
+  );
   const [autoScroll, setAutoScroll] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [volume, setVolume] = useState(0.7);
@@ -294,6 +322,9 @@ export function TranscriptView({
   const searchRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptScrollRef = useRef<HTMLElement>(null);
+  const speakerPanelRef = useRef<HTMLElement>(null);
+  const activeWordRef = useRef<string>();
+  const [liveActiveWordId, setLiveActiveWordId] = useState<string>();
   const selectedSpeakerId = turns.find(
     (turn) => turn.id === selectedTurn,
   )?.speakerId;
@@ -301,6 +332,18 @@ export function TranscriptView({
   useEffect(() => {
     setMeetingTitleDraft(meeting.title);
   }, [meeting.title]);
+
+  useEffect(() => {
+    if (!turns.length) {
+      setSelectedTurn(undefined);
+      return;
+    }
+    setSelectedTurn((current) =>
+      current && turns.some((turn) => turn.id === current)
+        ? current
+        : turns[0].id,
+    );
+  }, [meeting.id, turns]);
   const selectedSpeaker = speakers.find(
     (speaker) => speaker.id === selectedSpeakerId,
   );
@@ -315,6 +358,19 @@ export function TranscriptView({
     const earlierTurns = turns.filter((turn) => turn.startMs <= position);
     return earlierTurns[earlierTurns.length - 1]?.id;
   }, [position, turns]);
+  const wordTimeline = useMemo(() => {
+    const words = turns.flatMap((turn) => turn.words ?? []);
+    words.sort((left, right) => left.startMs - right.startMs);
+    return words;
+  }, [turns]);
+  const positionActiveWordId = useMemo(
+    () => findActiveWordId(wordTimeline, position),
+    [position, wordTimeline],
+  );
+  const activeWordId =
+    playing && mediaSourceUrl
+      ? liveActiveWordId ?? positionActiveWordId
+      : positionActiveWordId;
   const stageOrder = [
     "ingest",
     "normalize",
@@ -354,6 +410,16 @@ export function TranscriptView({
   }, [profileSampleTargetId]);
 
   useEffect(() => {
+    if (!selectedSpeakerId) return;
+    const selectedCard = Array.from(
+      speakerPanelRef.current?.querySelectorAll<HTMLElement>(
+        "[data-speaker-id]",
+      ) ?? [],
+    ).find((card) => card.dataset.speakerId === selectedSpeakerId);
+    selectedCard?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }, [selectedSpeakerId]);
+
+  useEffect(() => {
     if (!playing || !allowSimulatedPlayback || mediaSourceUrl) return;
     const timer = window.setInterval(
       () =>
@@ -362,12 +428,33 @@ export function TranscriptView({
             setPlaying(false);
             return 0;
           }
-          return current + 500 * speed;
+          return current + 100 * speed;
         }),
-      500,
+      100,
     );
     return () => window.clearInterval(timer);
   }, [allowSimulatedPlayback, mediaSourceUrl, playing, meeting.durationMs, speed]);
+
+  useEffect(() => {
+    if (!playing || !mediaSourceUrl || !audioRef.current) {
+      activeWordRef.current = positionActiveWordId;
+      setLiveActiveWordId(positionActiveWordId);
+      return;
+    }
+    let frame = 0;
+    const updateActiveWord = () => {
+      const media = audioRef.current;
+      if (!media) return;
+      const next = findActiveWordId(wordTimeline, media.currentTime * 1000);
+      if (next !== activeWordRef.current) {
+        activeWordRef.current = next;
+        setLiveActiveWordId(next);
+      }
+      frame = window.requestAnimationFrame(updateActiveWord);
+    };
+    frame = window.requestAnimationFrame(updateActiveWord);
+    return () => window.cancelAnimationFrame(frame);
+  }, [mediaSourceUrl, playing, positionActiveWordId, wordTimeline]);
 
   useEffect(() => {
     const media = audioRef.current;
@@ -715,6 +802,8 @@ export function TranscriptView({
             editable
             selectedTurnId={selectedTurn}
             activeTurnId={activeTurnId}
+            activeWordId={activeWordId}
+            playbackPositionMs={position}
             onSelectTurn={(turnId) => {
               setSelectedTurn(turnId);
               const turn = turns.find((candidate) => candidate.id === turnId);
@@ -725,7 +814,11 @@ export function TranscriptView({
             onToggleReview={onToggleTurnReview}
           />
         </section>
-        <aside className="speaker-panel" aria-label="Meeting speakers">
+        <aside
+          className="speaker-panel"
+          aria-label="Meeting speakers"
+          ref={speakerPanelRef}
+        >
           <div className="panel-heading">
             <h2>Speakers</h2>
             <ChevronDown size={18} />
@@ -735,6 +828,7 @@ export function TranscriptView({
               key={speaker.id}
               speaker={speaker}
               allSpeakers={speakers}
+              selected={speaker.id === selectedSpeakerId}
               suggestedProfileName={
                 profiles.find((profile) => profile.id === speaker.profileId)?.name
               }

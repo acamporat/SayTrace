@@ -24,7 +24,7 @@ use crate::{
     error::{CoreError, CoreResult},
     layout::{managed_child_directory, remove_managed_child_tree},
     media,
-    service::CoreService,
+    service::{CoreService, VOICE_PROFILE_MIN_CLEAN_DURATION_MS, VOICE_PROFILE_MIN_SAMPLES},
     worker::{worker_compatible_path, WorkerRequest, WorkerSupervisor, PIPELINE_VERSION},
 };
 
@@ -498,19 +498,25 @@ fn load_confirmed_profiles(core: &CoreService) -> CoreResult<Vec<Value>> {
          WHERE p.id IN (
             SELECT profile_id FROM voice_profile_samples
             GROUP BY profile_id
-            HAVING count(*)>=3 AND sum(clean_duration_ms)>=30000
+            HAVING count(*)>=?1 AND sum(clean_duration_ms)>=?2
          )
          ORDER BY p.id,s.confirmed_at_ms",
     )?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ))
-        })?
+        .query_map(
+            params![
+                VOICE_PROFILE_MIN_SAMPLES,
+                VOICE_PROFILE_MIN_CLEAN_DURATION_MS
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     let mut grouped: BTreeMap<String, (String, Vec<i64>, Vec<Vec<f32>>)> = BTreeMap::new();
     for (profile_id, name, duration, encrypted) in rows {
@@ -1054,10 +1060,10 @@ fn import_turn(
     };
     // A Review candidate is only a suggestion. Do not display a remembered
     // person's name until the user explicitly accepts it.
-    let speaker_name = if state == "review" {
-        "Unknown speaker"
+    let speaker_name = if matches!(state, "review" | "unknown") {
+        default_unknown_speaker_name(cluster)
     } else {
-        proposed_speaker_name
+        proposed_speaker_name.to_string()
     };
     let proposed_profile_id = match_result
         .and_then(|value| value.get("profile_id"))
@@ -1099,20 +1105,24 @@ fn import_turn(
              ) VALUES (?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(meeting_id,cluster_label) DO UPDATE SET
                 display_name=CASE
-                    WHEN meeting_speakers.display_name='Unknown'
-                     AND meeting_speakers.match_state='unknown'
+                    WHEN meeting_speakers.match_state='unknown'
+                     AND (meeting_speakers.display_name IN ('Unknown','Unknown speaker')
+                          OR meeting_speakers.display_name GLOB 'Speaker [0-9]*')
                     THEN excluded.display_name ELSE meeting_speakers.display_name END,
                 profile_id=CASE
-                    WHEN meeting_speakers.display_name='Unknown'
-                     AND meeting_speakers.match_state='unknown'
+                    WHEN meeting_speakers.match_state='unknown'
+                     AND (meeting_speakers.display_name IN ('Unknown','Unknown speaker')
+                          OR meeting_speakers.display_name GLOB 'Speaker [0-9]*')
                     THEN excluded.profile_id ELSE meeting_speakers.profile_id END,
                 match_state=CASE
-                    WHEN meeting_speakers.display_name='Unknown'
-                     AND meeting_speakers.match_state='unknown'
+                    WHEN meeting_speakers.match_state='unknown'
+                     AND (meeting_speakers.display_name IN ('Unknown','Unknown speaker')
+                          OR meeting_speakers.display_name GLOB 'Speaker [0-9]*')
                     THEN excluded.match_state ELSE meeting_speakers.match_state END,
                 needs_review=CASE
-                    WHEN meeting_speakers.display_name='Unknown'
-                     AND meeting_speakers.match_state='unknown'
+                    WHEN meeting_speakers.match_state='unknown'
+                     AND (meeting_speakers.display_name IN ('Unknown','Unknown speaker')
+                          OR meeting_speakers.display_name GLOB 'Speaker [0-9]*')
                     THEN excluded.needs_review ELSE meeting_speakers.needs_review END",
             params![
                 deterministic_speaker_id,
@@ -1342,6 +1352,23 @@ fn validate_job_id(job_id: &str) -> CoreResult<()> {
     Uuid::parse_str(job_id)
         .map(|_| ())
         .map_err(|_| CoreError::Security("processing job id is not a valid UUID".into()))
+}
+
+fn default_unknown_speaker_name(cluster_label: &str) -> String {
+    let trailing_digits = cluster_label
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let number = trailing_digits
+        .parse::<u32>()
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .unwrap_or(1);
+    format!("Speaker {number}")
 }
 
 fn namespaced_id(meeting_id: &str, value: &str) -> String {
@@ -1644,7 +1671,7 @@ mod tests {
             speaker.match_state,
             crate::models::SpeakerMatchState::Review
         );
-        assert_eq!(speaker.display_name, "Unknown speaker");
+        assert_eq!(speaker.display_name, "Speaker 1");
         assert!(speaker.needs_review);
 
         core.review_speaker_match(&speaker.id, true).unwrap();

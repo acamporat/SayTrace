@@ -74,7 +74,7 @@ describe("live draft revisions", () => {
     expect(new Set(turns.map((turn) => turn.id)).size).toBe(2);
     expect(speakers.map((speaker) => speaker.displayName)).toEqual([
       "You",
-      "Speaker",
+      "Speaker 1",
     ]);
     expect(speakers[1].state).toBe("Unknown");
   });

@@ -42,7 +42,8 @@ def _profile(
     name: str,
     vector: list[float],
     *,
-    samples: int = 3,
+    samples: int = 1,
+    duration_ms: int = 10_000,
     confirmed: bool = True,
 ) -> VoiceProfile:
     return VoiceProfile.from_dict(
@@ -50,7 +51,7 @@ def _profile(
             "profile_id": profile_id,
             "name": name,
             "embeddings": [vector] * samples,
-            "sample_durations_ms": [10_000] * samples,
+            "sample_durations_ms": [duration_ms] * samples,
             "explicitly_confirmed": confirmed,
         }
     )
@@ -67,7 +68,7 @@ def test_matching_requires_eligible_profile_and_margin() -> None:
     assert result.profile_id == "alex"
 
 
-def test_matching_accepts_only_confirmed_30_second_three_sample_profile() -> None:
+def test_matching_accepts_a_confirmed_ten_second_profile() -> None:
     policy = MatchPolicy("benchmark-1", 0.9, 0.08, 0.7)
     eligible = _profile("alex", "Alex", [1.0, 0.0])
     unconfirmed = _profile("other", "Other", [1.0, 0.0], confirmed=False)
@@ -80,9 +81,9 @@ def test_matching_accepts_only_confirmed_30_second_three_sample_profile() -> Non
 
 def test_ineligible_profiles_remain_unknown() -> None:
     policy = MatchPolicy("benchmark-1", 0.9, 0.08, 0.7)
-    too_few = _profile("alex", "Alex", [1.0, 0.0], samples=2)
+    too_short = _profile("alex", "Alex", [1.0, 0.0], duration_ms=9_999)
 
-    result = match_speaker([1.0, 0.0], [too_few], policy)
+    result = match_speaker([1.0, 0.0], [too_short], policy)
 
     assert result.state == "Unknown"
     assert result.profile_id is None
