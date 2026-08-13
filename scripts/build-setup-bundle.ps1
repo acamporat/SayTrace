@@ -29,6 +29,9 @@ if (Test-Path -LiteralPath $output) {
 foreach ($required in @(
     "Local-Transcript-App-Installer.exe",
     "install-runtime.ps1",
+    "preflight-runtime.ps1",
+    "verify-worker-runtime.ps1",
+    "dependencies.json",
     "runtime\runtime-manifest.json",
     "licenses\7zip\License.txt"
 )) {
@@ -57,7 +60,7 @@ $archive = Join-Path $temporaryRoot "payload.7z"
 try {
     Push-Location $bundle
     try {
-        & $sevenZip a -t7z $archive ".\*" -mx=5 -m0=lzma2 -ms=on -mmt=on
+        & $sevenZip a -t7z $archive ".\*" -mx=9 -m0=lzma2 -md=256m -mfb=273 -ms=on -mmt=on
         if ($LASTEXITCODE -ne 0) {
             throw "7-Zip could not create the SayTrace setup payload."
         }

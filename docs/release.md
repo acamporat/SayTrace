@@ -4,6 +4,7 @@ SayTrace ships as one self-extracting Windows setup executable. It
 contains:
 
 - the normal Tauri per-user NSIS installer;
+- Microsoft's WebView2 download bootstrapper;
 - the locked Python worker;
 - NVIDIA CUDA 12.8 libraries with CPU fallback; and
 - LGPL-compatible FFmpeg and FFprobe.
@@ -16,12 +17,18 @@ token. Setup downloads only the revision-pinned files in
 
 ## Install locations
 
-The setup verifies its appended 7z archive by SHA-256, extracts it to a private
-temporary directory, and opens the Tauri installer. The checked-in Tauri
-configuration uses NSIS `currentUser` mode, so installation does not require
-elevation. Its post-install hook verifies every runtime file against
-`runtime-manifest.json`, stages the copy, and atomically replaces the installed
-runtime:
+The setup verifies its appended 7z archive by SHA-256 and extracts it to a
+private temporary directory. Before the Tauri installer copies the application,
+its preflight validates Windows 11 x64, storage, the verified container and
+runtime manifest, required entrypoints, the worker handshake, GPU capability,
+Ollama, and a usable local agent model. A compatible
+existing Ollama/model installation is preserved. Otherwise setup downloads the
+pinned official per-user Ollama installer, checks its SHA-256 and Authenticode
+signature, installs it silently, and installs the pinned `qwen3:4b` starter
+model. The checked-in Tauri configuration uses NSIS `currentUser` mode, so the
+application and Ollama do not require elevation. The post-install hook performs
+the full per-file size and SHA-256 pass, stages the copy, and atomically replaces
+the installed runtime:
 
 ```text
 <SayTrace installation>\runtime\
@@ -45,6 +52,14 @@ non-roaming `app_local_data_dir()`:
 Reinstalling or updating the application replaces its bundled runtime while
 preserving that data directory. The app and worker process guard prevents
 install, update, or uninstall while SayTrace is running.
+
+The installer verifies NVIDIA display-driver capability but does not silently
+replace display drivers. When the compatible CUDA path is unavailable, both the
+transcription worker and Ollama retain CPU fallback. WebView2 is bundled in
+download-bootstrapper mode and is installed automatically before the app. A
+clean machine needs network access when setup must install WebView2, Ollama, or
+the starter agent model, and later when the user explicitly accepts and
+downloads the revision-pinned transcription models.
 
 ## Release inputs
 
@@ -78,6 +93,10 @@ The runtime staging step:
 - records supplier provenance and license notices;
 - records worker protocol, pipeline, and model revisions; and
 - hashes every payload file.
+
+`packaging/dependencies.json` separately pins the official Ollama installer and
+starter agent-model manifest. Release verification rejects missing hashes,
+non-HTTPS sources, an unpinned model, or removal of the GPU fallback policy.
 
 Create a validated runtime resource directory without creating a second
 end-user installer:
@@ -165,7 +184,7 @@ Validate the staged runtime payload:
 
 ```powershell
 .\scripts\release-verify.ps1 `
-  -ManifestPath C:\release-inputs\runtime-manifest\Local-Transcript-Runtime-Nvidia-0.1.0-windows-x64-UNSIGNED.payload-manifest.json `
+  -ManifestPath C:\release-inputs\runtime-manifest\Local-Transcript-Runtime-Nvidia-0.2.0-windows-x64-UNSIGNED.payload-manifest.json `
   -PayloadRoot C:\release-inputs\local-transcript-runtime
 ```
 
@@ -182,13 +201,14 @@ Validate the one-file setup release manifest:
 
 ```powershell
 .\scripts\release-verify.ps1 `
-  -ManifestPath C:\artifacts\local-transcript\Local-Transcript-0.1.0-Nvidia-windows-x64-UNSIGNED.release-manifest.json
+  -ManifestPath C:\artifacts\local-transcript\Local-Transcript-0.2.0-Nvidia-windows-x64-UNSIGNED.release-manifest.json
 ```
 
 Before publishing, test on a clean Windows 11 x64 non-admin account with no
-system Python, CUDA toolkit, FFmpeg, Node.js, or Rust. Verify:
+system Python, CUDA toolkit, FFmpeg, WebView2, Ollama, Node.js, or Rust. Verify:
 
 - installation and first launch;
+- pinned Ollama installation plus starter-model setup;
 - bundled-runtime detection without a separate download;
 - packaged worker handshake and GPU health;
 - CPU fallback;

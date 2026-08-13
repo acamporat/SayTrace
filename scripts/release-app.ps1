@@ -50,7 +50,23 @@ $cargoPath = Join-Path $repositoryRoot "src-tauri\Cargo.toml"
 $releaseConfigPath = Join-Path $repositoryRoot "packaging\tauri.release.conf.json"
 $bundledRuntimeHooksPath = Join-Path $repositoryRoot "packaging\app-installer-bundled-runtime-hooks.nsh"
 $runtimeInstallScriptPath = Join-Path $repositoryRoot "packaging\install-runtime.ps1"
+$runtimePreflightScriptPath = Join-Path $repositoryRoot "packaging\preflight-runtime.ps1"
+$workerVerifyScriptPath = Join-Path $repositoryRoot "scripts\verify-worker-runtime.ps1"
+$dependencyManifestPath = Join-Path $repositoryRoot "packaging\dependencies.json"
 $setupBundleScriptPath = Join-Path $repositoryRoot "scripts\build-setup-bundle.ps1"
+foreach ($packagingInput in @(
+    $releaseConfigPath,
+    $bundledRuntimeHooksPath,
+    $runtimeInstallScriptPath,
+    $runtimePreflightScriptPath,
+    $workerVerifyScriptPath,
+    $dependencyManifestPath,
+    $setupBundleScriptPath
+)) {
+    if (-not (Test-Path -LiteralPath $packagingInput -PathType Leaf)) {
+        throw "Required release packaging input does not exist: $packagingInput"
+    }
+}
 $runtimeRoot = [IO.Path]::GetFullPath($RuntimePayloadDirectory)
 if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {
     throw "Runtime payload directory does not exist: $runtimeRoot"
@@ -237,6 +253,15 @@ try {
     Copy-Item `
         -LiteralPath $runtimeInstallScriptPath `
         -Destination (Join-Path $bundleRoot "install-runtime.ps1")
+    Copy-Item `
+        -LiteralPath $runtimePreflightScriptPath `
+        -Destination (Join-Path $bundleRoot "preflight-runtime.ps1")
+    Copy-Item `
+        -LiteralPath $workerVerifyScriptPath `
+        -Destination (Join-Path $bundleRoot "verify-worker-runtime.ps1")
+    Copy-Item `
+        -LiteralPath $dependencyManifestPath `
+        -Destination (Join-Path $bundleRoot "dependencies.json")
     $sevenZipLicenseOutput = Join-Path $bundleRoot "licenses\7zip\License.txt"
     [IO.Directory]::CreateDirectory((Split-Path -Parent $sevenZipLicenseOutput)) | Out-Null
     Copy-Item -LiteralPath $resolvedSevenZipLicense -Destination $sevenZipLicenseOutput
@@ -278,6 +303,10 @@ try {
         runtime_manifest_sha256 = (Get-FileHash -LiteralPath $runtimeManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
         runtime_container       = "sha256_verified_self_extracting_7z"
         inner_installer         = "tauri_nsis_current_user"
+        webview2_install_mode   = "download_bootstrapper"
+        dependency_preflight    = "windows_storage_runtime_gpu_ollama_local_model"
+        ollama_install_policy   = "pinned_verified_install_if_missing_or_incompatible"
+        nvidia_driver_policy    = "verify_with_cpu_fallback_no_driver_mutation"
         silent_install_argument = "/S"
         seven_zip_version       = (Get-Item -LiteralPath $resolvedSevenZip).VersionInfo.FileVersion
         seven_zip_sha256        = (Get-FileHash -LiteralPath $resolvedSevenZip -Algorithm SHA256).Hash.ToLowerInvariant()

@@ -5,8 +5,11 @@ import App from "../App";
 import { ModelSetupView } from "../features/setup/ModelSetupView";
 
 describe("SayTrace workspace", () => {
-  it("renders the approved transcript editor with categorical speaker states", () => {
+  it("renders the approved transcript editor with categorical speaker states", async () => {
+    const user = userEvent.setup();
     render(<App />);
+
+    await user.click(screen.getByRole("tab", { name: "Speakers" }));
 
     expect(
       screen.getByRole("heading", { name: "Weekly production meeting" }),
@@ -160,6 +163,8 @@ describe("SayTrace workspace", () => {
     const user = userEvent.setup();
     render(<App />);
 
+    await user.click(screen.getByRole("tab", { name: "Speakers" }));
+
     await user.click(
       screen.getByRole("button", { name: /create voice profile/i }),
     );
@@ -180,6 +185,8 @@ describe("SayTrace workspace", () => {
     const user = userEvent.setup();
     render(<App />);
 
+    await user.click(screen.getByRole("tab", { name: "Speakers" }));
+
     await user.click(
       screen.getByRole("button", { name: "Accept Sam Rivera" }),
     );
@@ -191,6 +198,8 @@ describe("SayTrace workspace", () => {
   it("commits an inline speaker rename when focus leaves the field", async () => {
     const user = userEvent.setup();
     render(<App />);
+
+    await user.click(screen.getByRole("tab", { name: "Speakers" }));
 
     const renameButtons = screen.getAllByRole("button", { name: "Rename" });
     await user.click(renameButtons[0]);
@@ -209,6 +218,8 @@ describe("SayTrace workspace", () => {
     const user = userEvent.setup();
     render(<App />);
 
+    await user.click(screen.getByRole("tab", { name: "Speakers" }));
+
     await user.click(screen.getByText(/One thing to note/));
 
     expect(
@@ -219,6 +230,8 @@ describe("SayTrace workspace", () => {
   it("automatically creates a voice profile when an unknown speaker is renamed", async () => {
     const user = userEvent.setup();
     render(<App />);
+
+    await user.click(screen.getByRole("tab", { name: "Speakers" }));
 
     await user.click(
       screen.getByRole("button", { name: "More actions for Speaker 3" }),
@@ -240,6 +253,34 @@ describe("SayTrace workspace", () => {
     const taylorProfile = screen.getByText("Taylor Reed").closest("article");
     expect(taylorProfile).not.toBeNull();
     expect(within(taylorProfile!).getByText("Ready to match")).toBeInTheDocument();
+  });
+
+  it("asks the local transcript assistant and jumps back from a citation", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(
+      screen.getByRole("heading", { name: "Ask this transcript" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Runs locally on this device")).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "Summarize this meeting" }),
+    );
+    expect(
+      await screen.findByText(/Early beta activation was up 12%/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Key points" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Results:")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "03:00" }));
+    expect(
+      screen.getByText("Maya", {
+        selector: '[data-turn-id="turn-4"].is-selected strong',
+      }),
+    ).toBeInTheDocument();
   });
 });
 

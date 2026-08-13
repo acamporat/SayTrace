@@ -71,12 +71,46 @@ export interface TranscriptTurn {
   startMs: number;
   endMs: number;
   modelText: string;
-  editedText?: string;
+  editedText?: string | null;
   isDraft?: boolean;
   isMarked?: boolean;
   needsReview?: boolean;
   revision?: number;
   words?: WordTiming[];
+}
+
+export interface TranscriptCitation {
+  turnId: string;
+  startMs: number;
+  endMs: number;
+  speakerName: string;
+  snippet: string;
+}
+
+export interface TranscriptChatMessage {
+  id: string;
+  meetingId: string;
+  role: "user" | "assistant";
+  content: string;
+  citations: TranscriptCitation[];
+  model?: string;
+  createdAtMs: number;
+}
+
+export interface LocalAgentModel {
+  name: string;
+  parameterSize?: string;
+  quantizationLevel?: string;
+  sizeBytes: number;
+}
+
+export interface LocalAgentStatus {
+  state: "checking" | "ready" | "unavailable" | "no_models";
+  backend: string;
+  endpoint: string;
+  selectedModel?: string;
+  models: LocalAgentModel[];
+  message?: string;
 }
 
 export interface MeetingSpeaker {

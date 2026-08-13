@@ -6,6 +6,7 @@ mod db;
 mod error;
 mod job_coordinator;
 mod layout;
+mod local_agent;
 mod media;
 mod media_tools;
 mod models;
@@ -74,6 +75,10 @@ pub fn run() {
             commands::rename_meeting,
             commands::delete_meeting,
             commands::search_transcript,
+            commands::get_local_agent_status,
+            commands::list_transcript_chat,
+            commands::ask_transcript,
+            commands::clear_transcript_chat,
             commands::update_transcript_turn,
             commands::set_transcript_turn_review,
             commands::set_transcript_turn_bookmark,

@@ -6,10 +6,19 @@ param(
     [string]$SourceRuntime,
 
     [Parameter(Mandatory)]
-    [string]$DestinationRuntime
+    [string]$DestinationRuntime,
+
+    [Parameter()]
+    [switch]$ValidateOnly,
+
+    [Parameter()]
+    [switch]$SkipPayloadHashes
 )
 
 $ErrorActionPreference = "Stop"
+if ($SkipPayloadHashes -and -not $ValidateOnly) {
+    throw "Payload hashes may be skipped only for the pre-install manifest check."
+}
 
 function Get-LocalTranscriptSha256 {
     param([Parameter(Mandatory)][string]$FilePath)
@@ -58,7 +67,13 @@ if (
 ) {
     throw "The bundled processing runtime does not match SayTrace."
 }
-foreach ($record in $manifest.payload) {
+$payload = @($manifest.payload)
+if ($payload.Count -eq 0) {
+    throw "The bundled processing runtime manifest has no payload records."
+}
+$seenPaths = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$payloadBytes = [long]0
+foreach ($record in $payload) {
     $relative = [string]$record.path
     if (
         [IO.Path]::IsPathRooted($relative) -or
@@ -66,6 +81,9 @@ foreach ($record in $manifest.payload) {
         $relative.Replace("\", "/").StartsWith("../", [StringComparison]::Ordinal)
     ) {
         throw "The runtime manifest contains an unsafe path."
+    }
+    if (-not $seenPaths.Add($relative.Replace("\", "/"))) {
+        throw "The runtime manifest contains a duplicate payload path."
     }
     $candidate = [IO.Path]::GetFullPath((Join-Path $source $relative))
     $sourcePrefix = "$($source.TrimEnd('\','/'))$([IO.Path]::DirectorySeparatorChar)"
@@ -76,10 +94,25 @@ foreach ($record in $manifest.payload) {
     if ($item.Length -ne [long]$record.size) {
         throw "The bundled runtime failed its size check: $relative"
     }
-    $hash = Get-LocalTranscriptSha256 -FilePath $candidate
-    if ($hash -ne ([string]$record.sha256).ToLowerInvariant()) {
-        throw "The bundled runtime failed its SHA-256 check: $relative"
+    if (-not $SkipPayloadHashes) {
+        $hash = Get-LocalTranscriptSha256 -FilePath $candidate
+        if ($hash -ne ([string]$record.sha256).ToLowerInvariant()) {
+            throw "The bundled runtime failed its SHA-256 check: $relative"
+        }
     }
+    $payloadBytes += [long]$record.size
+}
+
+$validation = [pscustomobject]@{
+    runtime_version = [string]$manifest.runtime_version
+    variant = [string]$manifest.variant
+    worker_protocol_version = [string]$manifest.worker_protocol_version
+    pipeline_version = [string]$manifest.pipeline_version
+    payload_files = $payload.Count
+    payload_bytes = $payloadBytes
+}
+if ($ValidateOnly) {
+    return $validation
 }
 
 [IO.Directory]::CreateDirectory($destinationParent) | Out-Null
@@ -123,3 +156,4 @@ try {
         }
     }
 }
+$validation

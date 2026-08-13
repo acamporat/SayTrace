@@ -28,6 +28,21 @@ text. They do not contain data from a personal SayTrace installation.
 
 See [Architecture](docs/architecture.md), [Accuracy and privacy](docs/accuracy-and-privacy.md), and the [accepted design specification](docs/design-spec.md).
 
+## Ask this transcript
+
+Completed transcripts include an **Ask** panel for local question answering,
+summaries, decisions, and action items. Answers are grounded in the saved
+transcript and include timestamp citations that seek to the supporting turn.
+Chat history and citations are stored in the same local SQLite library as the
+meeting.
+
+This feature uses an Ollama server on the fixed loopback endpoint
+`http://127.0.0.1:11434`. The Windows setup verifies an existing compatible
+Ollama installation or installs a pinned official per-user build. If no local
+model exists, setup installs the pinned `qwen3:4b` starter model. Existing local
+models are preserved. SayTrace lists only installed, non-cloud models and never
+sends transcript text to a hosted model.
+
 ## Development prerequisites
 
 - Windows 11 x64
@@ -37,8 +52,13 @@ See [Architecture](docs/architecture.md), [Accuracy and privacy](docs/accuracy-a
 - FFmpeg and FFprobe for development imports
 
 The normal production installer includes the locked Python worker, NVIDIA CUDA
-runtime with CPU fallback, and LGPL-compatible FFmpeg. End users do not install
-Python, FFmpeg, a CUDA toolkit, or a separate SayTrace runtime pack.
+runtime with CPU fallback, LGPL-compatible FFmpeg, and automatic WebView2
+setup. Before copying SayTrace, setup verifies Windows, free storage, the
+runtime manifest and entrypoints, the worker handshake, GPU capability, Ollama,
+and a local agent model. The runtime copy then receives a full per-file SHA-256
+pass. End users do not install Python, FFmpeg, a CUDA toolkit, WebView2, Ollama,
+or a separate SayTrace runtime pack themselves. Setup does not replace display
+drivers: unsupported or outdated GPU drivers use the verified CPU fallback.
 Model files remain an explicit one-time first-run download because Community-1
 requires the user to accept its terms.
 
@@ -92,12 +112,13 @@ The release gate also requires:
 - device removal, pause/resume, disk-full, and forced-termination recovery;
 - blocked-network final transcription;
 - calibrated speaker-name false-accept testing;
-- clean Windows VM installation without system Python or CUDA;
+- clean Windows VM installation without system Python, CUDA, WebView2, or Ollama;
 - screenshot comparison against both checked-in concepts.
 
 ## Privacy boundary
 
 - Audio, video, transcripts, and model files stay in the local application-data library.
+- Transcript questions are sent only to the local Ollama loopback endpoint; hosted Ollama models are excluded.
 - Voice embeddings are protected with Windows DPAPI for the current user.
 - Audio and transcript files are not separately encrypted by the application; use BitLocker for whole-library at-rest encryption.
 - The worker runs in explicit offline mode after model setup and has no listening network port.

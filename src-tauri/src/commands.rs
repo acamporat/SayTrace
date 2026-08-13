@@ -126,6 +126,112 @@ pub fn search_transcript(
 }
 
 #[tauri::command]
+pub async fn get_local_agent_status() -> CommandResult<LocalAgentStatus> {
+    Ok(crate::local_agent::status().await)
+}
+
+#[tauri::command]
+pub fn list_transcript_chat(
+    meeting_id: String,
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<TranscriptChatMessage>> {
+    state
+        .core
+        .list_transcript_chat(&meeting_id, 100)
+        .map_err(ApiError::from)
+}
+
+#[tauri::command]
+pub async fn ask_transcript(
+    request: AskTranscriptRequest,
+    state: State<'_, AppState>,
+) -> CommandResult<TranscriptChatMessage> {
+    let question = request.question.trim();
+    if question.is_empty() || question.chars().count() > 500 {
+        return Err(ApiError::new(
+            "invalid_question",
+            "Question must be between 1 and 500 characters.",
+        ));
+    }
+    let turns = state
+        .core
+        .agent_context_turns(&request.meeting_id)
+        .map_err(ApiError::from)?;
+    if turns.is_empty() {
+        return Err(ApiError::new(
+            "transcript_not_ready",
+            "This meeting does not have a finalized transcript to ask about yet.",
+        ));
+    }
+    let history = state
+        .core
+        .list_transcript_chat(&request.meeting_id, 20)
+        .map_err(ApiError::from)?;
+    let status = crate::local_agent::status().await;
+    let model = request
+        .model
+        .as_deref()
+        .or(status.selected_model.as_deref())
+        .map(str::to_string);
+    state
+        .core
+        .save_transcript_chat_message(
+            &request.meeting_id,
+            "user",
+            question.to_string(),
+            Vec::new(),
+            model.clone(),
+        )
+        .map_err(ApiError::from)?;
+    let reply = crate::local_agent::ask(
+        &status,
+        request.model.as_deref(),
+        question,
+        &turns,
+        &history,
+    )
+    .await
+    .map_err(local_agent_api_error)?;
+    state
+        .core
+        .save_transcript_chat_message(
+            &request.meeting_id,
+            "assistant",
+            reply.answer,
+            reply.citations,
+            model,
+        )
+        .map_err(ApiError::from)
+}
+
+#[tauri::command]
+pub fn clear_transcript_chat(meeting_id: String, state: State<'_, AppState>) -> CommandResult<()> {
+    state
+        .core
+        .clear_transcript_chat(&meeting_id)
+        .map_err(ApiError::from)
+}
+
+fn local_agent_api_error(error: crate::local_agent::LocalAgentError) -> ApiError {
+    use crate::local_agent::LocalAgentError;
+    match error {
+        LocalAgentError::Unavailable(message) => {
+            ApiError::new("local_agent_unavailable", message).retryable()
+        }
+        LocalAgentError::ModelUnavailable => ApiError::new(
+            "local_agent_model_missing",
+            "No installed local Ollama model is available for transcript questions.",
+        ),
+        LocalAgentError::Request(error) => {
+            ApiError::new("local_agent_request_failed", error.to_string()).retryable()
+        }
+        LocalAgentError::InvalidResponse(message) => {
+            ApiError::new("local_agent_invalid_response", message).retryable()
+        }
+    }
+}
+
+#[tauri::command]
 pub fn update_transcript_turn(
     turn_id: String,
     edited_text: String,

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "product": "SayTrace",
+  "platform": "windows-x64",
+  "ollama": {
+    "minimum_version": "0.12.0",
+    "installer_version": "0.32.9",
+    "installer_url": "https://github.com/ollama/ollama/releases/download/v0.32.9/OllamaSetup.exe",
+    "installer_sha256": "57fde2adad686d2b7bcb01a4c083e5112417410945a2f0c8fb3328d9b21d8990",
+    "license_url": "https://github.com/ollama/ollama/blob/v0.32.9/LICENSE"
+  },
+  "default_agent_model": {
+    "name": "qwen3:4b",
+    "manifest_url": "https://registry.ollama.ai/v2/library/qwen3/manifests/4b",
+    "manifest_sha256": "359d7dd4bcdab3d86b87d73ac27966f4dbb9f5efdfcc75d34a8764a09474fae7",
+    "model_blob_size": 2497280480,
+    "license": "Apache-2.0",
+    "license_url": "https://ollama.com/library/qwen3:4b"
+  },
+  "nvidia": {
+    "minimum_ollama_driver_version": "551.61",
+    "driver_policy": "verify_and_use_cpu_fallback"
+  },
+  "additional_free_space_bytes": 10737418240
+}

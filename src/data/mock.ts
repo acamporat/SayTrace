@@ -137,6 +137,7 @@ export const transcriptTurns: TranscriptTurn[] = [
     endMs: 231_000,
     modelText:
       "Early results look promising. Activation is up 12% and drop-off decreased by 8%. We’ll share the full report later this week.",
+    editedText: null,
     words: evenlyTimedWords(
       "turn-4",
       "Early results look promising. Activation is up 12% and drop-off decreased by 8%. We’ll share the full report later this week.",

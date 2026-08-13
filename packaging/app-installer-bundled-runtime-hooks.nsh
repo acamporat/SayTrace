@@ -20,6 +20,22 @@
   IfFileExists "$EXEDIR\install-runtime.ps1" +3 0
     MessageBox MB_ICONSTOP|MB_OK "The SayTrace runtime installer is missing. Download the complete setup again."
     Abort
+  IfFileExists "$EXEDIR\preflight-runtime.ps1" +3 0
+    MessageBox MB_ICONSTOP|MB_OK "The SayTrace dependency preflight is missing. Download the complete setup again."
+    Abort
+  IfFileExists "$EXEDIR\verify-worker-runtime.ps1" +3 0
+    MessageBox MB_ICONSTOP|MB_OK "The SayTrace worker verifier is missing. Download the complete setup again."
+    Abort
+  IfFileExists "$EXEDIR\dependencies.json" +3 0
+    MessageBox MB_ICONSTOP|MB_OK "The SayTrace dependency manifest is missing. Download the complete setup again."
+    Abort
+  DetailPrint "Verifying Windows, storage, local transcription, GPU capability, Ollama, and a local agent model..."
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$EXEDIR\preflight-runtime.ps1" -SourceRuntime "$EXEDIR\runtime" -DestinationRuntime "$INSTDIR\runtime" -InstallRuntimeScript "$EXEDIR\install-runtime.ps1" -VerifyWorkerScript "$EXEDIR\verify-worker-runtime.ps1" -DependencyManifest "$EXEDIR\dependencies.json"'
+  Pop $0
+  StrCmp $0 "0" local_transcript_preflight_ready
+    MessageBox MB_ICONSTOP|MB_OK "SayTrace did not install because a required local dependency failed verification. Check the setup details, correct the reported issue, and run setup again."
+    Abort
+  local_transcript_preflight_ready:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

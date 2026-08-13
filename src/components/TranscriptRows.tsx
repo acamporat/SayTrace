@@ -56,6 +56,38 @@ function HighlightedSlice({
   );
 }
 
+function findWordRange(text: string, token: string, cursor: number) {
+  const exactStart = text
+    .toLocaleLowerCase()
+    .indexOf(token.toLocaleLowerCase(), cursor);
+  if (exactStart >= 0) {
+    return { start: exactStart, end: exactStart + token.length };
+  }
+
+  const normalizedToken = Array.from(token.toLocaleLowerCase()).filter((char) =>
+    /[\p{L}\p{N}]/u.test(char),
+  );
+  if (!normalizedToken.length) return undefined;
+
+  let matched = 0;
+  let start = -1;
+  for (let index = cursor; index < text.length; index += 1) {
+    const char = text[index].toLocaleLowerCase();
+    if (!/[\p{L}\p{N}]/u.test(char)) continue;
+    if (char === normalizedToken[matched]) {
+      if (matched === 0) start = index;
+      matched += 1;
+      if (matched === normalizedToken.length) {
+        return { start, end: index + 1 };
+      }
+    } else {
+      matched = char === normalizedToken[0] ? 1 : 0;
+      start = matched ? index : -1;
+    }
+  }
+  return undefined;
+}
+
 function TimedTranscriptText({
   text,
   query,
@@ -88,8 +120,9 @@ function TimedTranscriptText({
   for (const word of words) {
     const token = word.text.trim();
     if (!token) continue;
-    const start = lowerText.indexOf(token.toLocaleLowerCase(), cursor);
-    if (start < 0) return <HighlightedText text={text} query={query} />;
+    const range = findWordRange(text, token, cursor);
+    if (!range) continue;
+    const { start, end } = range;
     if (start > cursor) {
       parts.push({
         key: `gap-${word.id}`,
@@ -97,7 +130,6 @@ function TimedTranscriptText({
         start: cursor,
       });
     }
-    const end = start + token.length;
     parts.push({ key: word.id, text: text.slice(start, end), start, word });
     cursor = end;
   }
@@ -181,7 +213,7 @@ export function TranscriptRows({
           };
         const displayText = turn.editedText ?? turn.modelText;
         const alignedWords =
-          turn.editedText === undefined || turn.editedText === turn.modelText
+          turn.editedText == null || turn.editedText === turn.modelText
             ? turn.words
             : undefined;
         return (
@@ -209,9 +241,12 @@ export function TranscriptRows({
                   aria-label={`${speaker.displayName} transcript at ${formatDuration(
                     turn.startMs,
                   )}`}
-                  onBlur={(event) =>
-                    onEdit?.(turn.id, event.currentTarget.textContent ?? "")
-                  }
+                  onBlur={(event) => {
+                    const editedText = event.currentTarget.textContent ?? "";
+                    if (editedText !== displayText) {
+                      onEdit?.(turn.id, editedText);
+                    }
+                  }}
                 >
                   <TimedTranscriptText
                     text={displayText}

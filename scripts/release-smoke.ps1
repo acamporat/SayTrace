@@ -28,8 +28,8 @@ try {
             "/DOUTPUT_FILE=$smokeOutput",
             "/DINSTALLER_ICON=$icon",
             "/DRUNTIME_VARIANT=Smoke",
-            "/DRUNTIME_VERSION=0.1.0",
-            "/DVERSION_QUAD=0.1.0.0",
+            "/DRUNTIME_VERSION=0.2.0",
+            "/DVERSION_QUAD=0.2.0.0",
             $installer
         ) `
         -FailureMessage "The runtime NSIS template did not compile."

@@ -1,4 +1,4 @@
-#requires -Version 7.2
+#requires -Version 5.1
 
 [CmdletBinding()]
 param(
@@ -9,7 +9,13 @@ param(
     [string]$FfmpegExecutable,
 
     [Parameter()]
-    [switch]$RequireNvidia
+    [switch]$RequireNvidia,
+
+    [Parameter()]
+    [string]$ExpectedProtocolVersion = "1.0",
+
+    [Parameter()]
+    [string]$ExpectedPipelineVersion = "2026.07.28.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +36,7 @@ function Read-WorkerBytes {
         [int]$Count
     )
 
-    $buffer = [byte[]]::new($Count)
+    $buffer = New-Object byte[] $Count
     $offset = 0
     while ($offset -lt $Count) {
         $read = $Stream.Read($buffer, $offset, $Count - $offset)
@@ -79,7 +85,7 @@ function Write-WorkerMessage {
     if ([BitConverter]::IsLittleEndian) {
         [Array]::Reverse($lengthBytes)
     }
-    $header = [byte[]]::new(16)
+    $header = New-Object byte[] 16
     [Text.Encoding]::ASCII.GetBytes("LTW1").CopyTo($header, 0)
     $header[4] = 1
     $header[5] = 1
@@ -98,9 +104,9 @@ $allowedRoot = Join-Path $temporaryRoot "library"
 $process = $null
 $stderrTask = $null
 try {
-    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName = $worker
-    foreach ($argument in @(
+    $arguments = @(
         "--model-root",
         $modelRoot,
         "--allowed-root",
@@ -109,16 +115,21 @@ try {
         $ffmpeg,
         "--heartbeat-seconds",
         "3600"
-    )) {
-        $start.ArgumentList.Add($argument)
+    )
+    foreach ($argument in $arguments) {
+        if ([string]$argument -match '"') {
+            throw "The worker smoke-test path contains an unsupported quote character."
+        }
     }
+    $start.Arguments = ($arguments | ForEach-Object { '"' + [string]$_ + '"' }) -join " "
+    $start.WorkingDirectory = Split-Path -Parent $worker
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
 
-    $process = [Diagnostics.Process]::new()
+    $process = New-Object Diagnostics.Process
     $process.StartInfo = $start
     if (-not $process.Start()) {
         throw "The packaged worker process could not be started."
@@ -130,8 +141,8 @@ try {
     $hello = Read-WorkerMessage -Stream $output
     if (
         [string]$hello.event -ne "hello" -or
-        [string]$hello.protocol_version -ne "1.0" -or
-        [string]$hello.payload.pipeline_version -ne "2026.07.28.1"
+        [string]$hello.protocol_version -ne $ExpectedProtocolVersion -or
+        [string]$hello.payload.pipeline_version -ne $ExpectedPipelineVersion
     ) {
         throw "The packaged worker handshake is incompatible with this application."
     }
@@ -188,7 +199,7 @@ try {
     }
 } finally {
     if ($process -and -not $process.HasExited) {
-        $process.Kill($true)
+        $process.Kill()
         $process.WaitForExit()
     }
     $resolvedTemporary = [IO.Path]::GetFullPath($temporaryRoot)

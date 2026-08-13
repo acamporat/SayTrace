@@ -8,7 +8,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::CoreResult;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS app_meta (
@@ -306,6 +306,21 @@ ALTER TABLE meetings ADD COLUMN needs_review INTEGER NOT NULL DEFAULT 0
 ALTER TABLE meetings ADD COLUMN recovery_warning TEXT;
 "#;
 
+const MIGRATION_5: &str = r#"
+CREATE TABLE IF NOT EXISTS transcript_chat_messages (
+    id TEXT PRIMARY KEY NOT NULL,
+    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    citations_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(citations_json)),
+    model TEXT,
+    created_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_transcript_chat_meeting
+ON transcript_chat_messages(meeting_id, created_at_ms, id);
+"#;
+
 #[derive(Debug, Clone)]
 pub struct Database {
     path: PathBuf,
@@ -369,6 +384,13 @@ impl Database {
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(MIGRATION_4)?;
             transaction.pragma_update(None, "user_version", 4)?;
+            transaction.commit()?;
+        }
+        if current < 5 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(MIGRATION_5)?;
+            transaction.pragma_update(None, "user_version", 5)?;
             transaction.commit()?;
         }
         Ok(())

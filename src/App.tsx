@@ -40,6 +40,7 @@ import type {
   AppStatus,
   AppView,
   Marker,
+  LocalAgentStatus,
   Meeting,
   MeetingSpeaker,
   ModelPackStatus,
@@ -49,6 +50,7 @@ import type {
   RecordingSession,
   RecordingLevels,
   TranscriptTurn,
+  TranscriptChatMessage,
   VoiceProfile,
 } from "./types";
 
@@ -89,6 +91,20 @@ function normalizeSpeakers(raw: MeetingSpeaker[]): MeetingSpeaker[] {
         .map((part) => part[0]?.toUpperCase())
         .join(""),
   }));
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message;
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof error.message === "string"
+  ) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) return error;
+  return fallback;
 }
 
 function transcriptText(
@@ -198,6 +214,32 @@ export default function App() {
   const [profileSampleTargetId, setProfileSampleTargetId] =
     useState<string>();
   const [toast, setToast] = useState<ToastMessage>();
+  const [agentStatus, setAgentStatus] = useState<LocalAgentStatus>(
+    desktopRuntime
+      ? {
+          state: "checking",
+          backend: "Ollama",
+          endpoint: "127.0.0.1:11434",
+          models: [],
+        }
+      : {
+          state: "ready",
+          backend: "Ollama",
+          endpoint: "127.0.0.1:11434",
+          selectedModel: "qwen2.5vl:7b",
+          models: [
+            {
+              name: "qwen2.5vl:7b",
+              parameterSize: "7B",
+              quantizationLevel: "Q4_K_M",
+              sizeBytes: 6_000_000_000,
+            },
+          ],
+        },
+  );
+  const [chatMessages, setChatMessages] = useState<TranscriptChatMessage[]>([]);
+  const [agentLoading, setAgentLoading] = useState(false);
+  const [agentError, setAgentError] = useState<string>();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const toastSequence = useRef(0);
   const recordingSessionRef = useRef<RecordingSession>();
@@ -423,6 +465,44 @@ export default function App() {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [desktopRuntime, meetingRefreshToken, view]);
+
+  useEffect(() => {
+    if (view.kind !== "transcript") return;
+    setAgentError(undefined);
+    setAgentLoading(false);
+    if (!desktopRuntime) {
+      setChatMessages([]);
+      return;
+    }
+    let alive = true;
+    setChatMessages([]);
+    setAgentStatus((current) => ({ ...current, state: "checking" }));
+    void Promise.all([
+      invokeCommand("get_local_agent_status"),
+      invokeCommand("list_transcript_chat", { meetingId: view.meetingId }),
+    ])
+      .then(([status, messages]) => {
+        if (!alive) return;
+        setAgentStatus(status);
+        setChatMessages(messages);
+      })
+      .catch((error) => {
+        if (!alive) return;
+        setAgentStatus({
+          state: "unavailable",
+          backend: "Ollama",
+          endpoint: "127.0.0.1:11434",
+          models: [],
+          message:
+            error instanceof Error
+              ? error.message
+              : "The local AI runtime could not be checked.",
+        });
+      });
+    return () => {
+      alive = false;
+    };
+  }, [desktopRuntime, view]);
 
   async function importMedia() {
     setNewDialogOpen(false);
@@ -1273,6 +1353,122 @@ export default function App() {
     notify(`Transcript exported as ${format.toUpperCase()}.`);
   }
 
+  async function refreshAgentStatus() {
+    setAgentError(undefined);
+    if (!desktopRuntime) {
+      setAgentStatus((current) => ({ ...current, state: "ready" }));
+      return;
+    }
+    setAgentStatus((current) => ({ ...current, state: "checking" }));
+    try {
+      setAgentStatus(await invokeCommand("get_local_agent_status"));
+    } catch (error) {
+      setAgentStatus({
+        state: "unavailable",
+        backend: "Ollama",
+        endpoint: "127.0.0.1:11434",
+        models: [],
+        message: errorMessage(error, "The local AI runtime could not be checked."),
+      });
+    }
+  }
+
+  async function askTranscript(question: string, model?: string) {
+    if (!selectedMeeting) return;
+    const optimistic: TranscriptChatMessage = {
+      id: `pending-${Date.now()}`,
+      meetingId: selectedMeeting.id,
+      role: "user",
+      content: question,
+      citations: [],
+      model,
+      createdAtMs: Date.now(),
+    };
+    setAgentError(undefined);
+    setAgentLoading(true);
+    setChatMessages((current) => [...current, optimistic]);
+    try {
+      if (desktopRuntime) {
+        const response = await invokeCommand("ask_transcript", {
+          request: { meetingId: selectedMeeting.id, question, model },
+        });
+        setChatMessages((current) => [...current, response]);
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 550));
+      const lower = question.toLocaleLowerCase();
+      let answer =
+        "The meeting focused on early beta results, a permissions-step usability issue, and the follow-up work planned for later this week.\n\n## Key points\n- **Beta results:** Activation improved while drop-off declined.\n- **User friction:** Participants saw confusion around the permissions step.\n- **Next step:** The team discussed a short explanation near that step.";
+      let citedTurns = turns.slice(2, 5);
+      if (lower.includes("decision")) {
+        answer =
+          "No firm decision was recorded.\n\n## Proposed, not decided\n- **Permissions tooltip:** Alex suggested adding a short explanation to reduce confusion around the permissions step.";
+        citedTurns = turns.filter((turn) =>
+          (turn.editedText ?? turn.modelText).toLocaleLowerCase().includes("tooltip"),
+        );
+      } else if (lower.includes("action") || lower.includes("follow")) {
+        answer =
+          "Two concrete follow-ups were captured.\n\n## Action items\n- **Maya’s team** — Share the full beta report — later this week.\n- **Owner not stated** — Draft options for the permissions explanation — Timing not stated.";
+        citedTurns = turns.filter((turn) => {
+          const text = (turn.editedText ?? turn.modelText).toLocaleLowerCase();
+          return text.includes("full report") || text.includes("draft some options");
+        });
+      } else if (lower.includes("summar") || lower.includes("metric")) {
+        answer =
+          "Early beta activation was up 12% while drop-off fell 8%.\n\n## Key points\n- **Results:** Activation rose 12%, and drop-off declined 8%.\n- **User friction:** The permissions step caused confusion.\n\n## Proposed, not decided\n- Add a short explanatory tooltip near the permissions step.";
+        citedTurns = turns.filter((turn) => {
+          const text = (turn.editedText ?? turn.modelText).toLocaleLowerCase();
+          return text.includes("12%") || text.includes("permissions step") || text.includes("tooltip");
+        });
+      }
+      const response: TranscriptChatMessage = {
+        id: `preview-answer-${Date.now()}`,
+        meetingId: selectedMeeting.id,
+        role: "assistant",
+        content: answer,
+        citations: citedTurns.slice(0, 4).map((turn) => ({
+          turnId: turn.id,
+          startMs: turn.startMs,
+          endMs: turn.endMs,
+          speakerName:
+            speakers.find((speaker) => speaker.id === turn.speakerId)?.displayName ??
+            "Unknown speaker",
+          snippet: turn.editedText ?? turn.modelText,
+        })),
+        model: model ?? agentStatus.selectedModel,
+        createdAtMs: Date.now(),
+      };
+      setChatMessages((current) => [...current, response]);
+    } catch (error) {
+      setAgentError(
+        errorMessage(
+          error,
+          "The local model could not answer. Check Ollama and try again.",
+        ),
+      );
+    } finally {
+      setAgentLoading(false);
+    }
+  }
+
+  async function clearTranscriptChat() {
+    if (!selectedMeeting) return;
+    setAgentError(undefined);
+    try {
+      if (desktopRuntime) {
+        await invokeCommand("clear_transcript_chat", {
+          meetingId: selectedMeeting.id,
+        });
+      }
+      setChatMessages([]);
+      notify("Local transcript conversation cleared.", "info");
+    } catch (error) {
+      setAgentError(
+        errorMessage(error, "The local transcript conversation could not be cleared."),
+      );
+    }
+  }
+
   const content = (() => {
     if (view.kind === "library") {
       return (
@@ -1427,6 +1623,10 @@ export default function App() {
         )}
         profiles={profiles}
         profileSampleTargetId={profileSampleTargetId}
+        chatMessages={chatMessages}
+        agentStatus={agentStatus}
+        agentLoading={agentLoading}
+        agentError={agentError}
         onUpdateTurn={updateTurn}
         onToggleMarker={toggleMarker}
         onToggleTurnReview={toggleTurnReview}
@@ -1438,6 +1638,9 @@ export default function App() {
         onRetryJob={retryJob}
         onConfirmVoiceSample={confirmVoiceSample}
         onExport={exportMeeting}
+        onAskTranscript={askTranscript}
+        onClearTranscriptChat={clearTranscriptChat}
+        onRefreshAgentStatus={refreshAgentStatus}
       />
     );
   })();

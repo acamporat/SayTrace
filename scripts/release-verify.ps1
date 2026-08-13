@@ -76,6 +76,7 @@ function Assert-SourceReleaseContracts {
     $libPath = Join-Path $RepositoryRoot "src-tauri\src\lib.rs"
     $workerHostPath = Join-Path $RepositoryRoot "src-tauri\src\worker.rs"
     $appInstallerHooksPath = Join-Path $RepositoryRoot "packaging\app-installer-hooks.nsh"
+    $tauriReleaseConfigPath = Join-Path $RepositoryRoot "packaging\tauri.release.conf.json"
     $runtimeInstallerPath = Join-Path $RepositoryRoot "packaging\runtime\runtime-installer.nsi"
     $appReleaseScriptPath = Join-Path $RepositoryRoot "scripts\release-app.ps1"
     $runtimeReleaseScriptPath = Join-Path $RepositoryRoot "scripts\release-runtime.ps1"
@@ -84,11 +85,15 @@ function Assert-SourceReleaseContracts {
     $workerEntrypointPath = Join-Path $RepositoryRoot "worker\pyinstaller_entrypoint.py"
     $bundledRuntimeHooksPath = Join-Path $RepositoryRoot "packaging\app-installer-bundled-runtime-hooks.nsh"
     $bundledRuntimeInstallPath = Join-Path $RepositoryRoot "packaging\install-runtime.ps1"
+    $bundledRuntimePreflightPath = Join-Path $RepositoryRoot "packaging\preflight-runtime.ps1"
+    $dependencyManifestPath = Join-Path $RepositoryRoot "packaging\dependencies.json"
+    $workerVerifyPath = Join-Path $RepositoryRoot "scripts\verify-worker-runtime.ps1"
     $setupBundleScriptPath = Join-Path $RepositoryRoot "scripts\build-setup-bundle.ps1"
     $modelManifestPath = Join-Path $RepositoryRoot "worker\model-manifest.json"
     $revisionsPath = Join-Path $RepositoryRoot "packaging\revisions.json"
 
     $tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
+    $tauriReleaseConfig = Get-Content -LiteralPath $tauriReleaseConfigPath -Raw | ConvertFrom-Json
     $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
     $cargoVersionLine = Select-String -LiteralPath $cargoPath -Pattern '^version\s*=\s*"([^"]+)"' |
         Select-Object -First 1
@@ -104,6 +109,12 @@ function Assert-SourceReleaseContracts {
     }
     if ([string]$tauriConfig.bundle.windows.nsis.installMode -ne "currentUser") {
         throw "Tauri NSIS installMode must remain currentUser."
+    }
+    if (
+        [string]$tauriReleaseConfig.bundle.windows.webviewInstallMode.type -ne "downloadBootstrapper" -or
+        -not [bool]$tauriReleaseConfig.bundle.windows.webviewInstallMode.silent
+    ) {
+        throw "Release builds must use the silent WebView2 download bootstrapper."
     }
     $configuredHooks = [string]$tauriConfig.bundle.windows.nsis.installerHooks
     if (-not $configuredHooks) {
@@ -229,15 +240,59 @@ function Assert-SourceReleaseContracts {
     }
     $bundledRuntimeHooks = Get-Content -LiteralPath $bundledRuntimeHooksPath -Raw
     $bundledRuntimeInstall = Get-Content -LiteralPath $bundledRuntimeInstallPath -Raw
+    $bundledRuntimePreflight = Get-Content -LiteralPath $bundledRuntimePreflightPath -Raw
+    $workerVerify = Get-Content -LiteralPath $workerVerifyPath -Raw
     $setupBundleScript = Get-Content -LiteralPath $setupBundleScriptPath -Raw
+    $dependencyManifest = Get-Content -LiteralPath $dependencyManifestPath -Raw | ConvertFrom-Json
     if (
         -not $bundledRuntimeHooks.Contains("NSIS_HOOK_POSTINSTALL") -or
         -not $bundledRuntimeHooks.Contains("install-runtime.ps1") -or
+        -not $bundledRuntimeHooks.Contains("NSIS_HOOK_PREINSTALL") -or
+        -not $bundledRuntimeHooks.Contains("preflight-runtime.ps1") -or
+        -not $bundledRuntimeHooks.Contains("dependencies.json") -or
+        -not $bundledRuntimeHooks.Contains("nsExec::ExecToLog") -or
         -not $bundledRuntimeInstall.Contains("[Security.Cryptography.SHA256]::Create()") -or
         -not $bundledRuntimeInstall.Contains("runtime-manifest.json") -or
+        -not $bundledRuntimeInstall.Contains("[switch]`$ValidateOnly") -or
+        -not $bundledRuntimePreflight.Contains("Install-SayTraceOllama") -or
+        -not $bundledRuntimePreflight.Contains("Install-SayTraceDefaultModel") -or
+        -not $bundledRuntimePreflight.Contains("Get-AuthenticodeSignature") -or
+        -not $bundledRuntimePreflight.Contains("minimum_ollama_driver_version") -or
+        -not $workerVerify.Contains("ExpectedProtocolVersion") -or
         -not $setupBundleScript.Contains("LTRSFXBUNDLE0001")
     ) {
-        throw "The one-file setup must verify, stage, and atomically add its bundled runtime."
+        throw "The one-file setup must preflight, verify, stage, and atomically add every local dependency."
+    }
+    foreach ($bundledFile in @(
+        '"preflight-runtime.ps1"',
+        '"verify-worker-runtime.ps1"',
+        '"dependencies.json"'
+    )) {
+        if (-not $setupBundleScript.Contains($bundledFile)) {
+            throw "The setup bundle does not require $bundledFile."
+        }
+    }
+    if (
+        [int]$dependencyManifest.schema_version -ne 1 -or
+        [string]$dependencyManifest.product -ne "SayTrace" -or
+        [string]$dependencyManifest.platform -ne "windows-x64" -or
+        [string]$dependencyManifest.ollama.installer_url -notmatch '^https://github\.com/ollama/ollama/releases/download/v' -or
+        [string]$dependencyManifest.ollama.installer_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$dependencyManifest.default_agent_model.manifest_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [long]$dependencyManifest.default_agent_model.model_blob_size -le 0 -or
+        [long]$dependencyManifest.additional_free_space_bytes -lt 8GB -or
+        [string]$dependencyManifest.nvidia.driver_policy -ne "verify_and_use_cpu_fallback"
+    ) {
+        throw "packaging/dependencies.json must pin Ollama and the starter local model with safe GPU fallback."
+    }
+    foreach ($requiredCopy in @(
+        "preflight-runtime.ps1",
+        "verify-worker-runtime.ps1",
+        "dependencies.json"
+    )) {
+        if (-not $appReleaseScript.Contains($requiredCopy)) {
+            throw "release-app.ps1 does not copy $requiredCopy into the one-file setup."
+        }
     }
     $workerBuildScript = Get-Content -LiteralPath $workerBuildScriptPath -Raw
     $workerSpec = Get-Content -LiteralPath $workerSpecPath -Raw
@@ -294,6 +349,9 @@ function Assert-SourceReleaseContracts {
     Write-Host "  App version: $($tauriConfig.version)"
     Write-Host "  Data root: %LOCALAPPDATA%\$($tauriConfig.identifier)"
     Write-Host "  App installer guard: $configuredHooks"
+    Write-Host "  WebView2: automatic download bootstrapper"
+    Write-Host "  Ollama installer: $($dependencyManifest.ollama.installer_version)"
+    Write-Host "  Starter agent model: $($dependencyManifest.default_agent_model.name)"
     Write-Host "  Worker protocol: $($revisions.worker_protocol_version)"
     Write-Host "  Pipeline: $($revisions.pipeline_version)"
     Write-Host "  Model manifest SHA-256: $((Get-FileHash -LiteralPath $modelManifestPath -Algorithm SHA256).Hash.ToLowerInvariant())"

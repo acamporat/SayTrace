@@ -4,6 +4,7 @@ import type {
   DeviceWarningEvent,
   DraftRevisionEvent,
   JobProgressEvent,
+  LocalAgentStatus,
   Marker,
   Meeting,
   MeetingChangedEvent,
@@ -17,6 +18,7 @@ import type {
   RecordingStatus,
   RenameSpeakerResult,
   TranscriptTurn,
+  TranscriptChatMessage,
   VoiceProfile,
   WorkerHealthEvent,
 } from "../types";
@@ -89,6 +91,21 @@ export interface CommandMap {
       text: string;
       snippet: string;
     }>;
+  };
+  get_local_agent_status: { args: undefined; result: LocalAgentStatus };
+  list_transcript_chat: {
+    args: { meetingId: string };
+    result: TranscriptChatMessage[];
+  };
+  ask_transcript: {
+    args: {
+      request: { meetingId: string; question: string; model?: string };
+    };
+    result: TranscriptChatMessage;
+  };
+  clear_transcript_chat: {
+    args: { meetingId: string };
+    result: void;
   };
   list_audio_devices: { args: undefined; result: AudioDevice[] };
   get_recording_status: { args: undefined; result: RecordingStatus };

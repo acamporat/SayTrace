@@ -513,6 +513,119 @@ impl CoreService {
         Ok(hits)
     }
 
+    pub fn agent_context_turns(&self, meeting_id: &str) -> CoreResult<Vec<AgentContextTurn>> {
+        validate_id(meeting_id, "meeting")?;
+        let connection = self.database.connect()?;
+        let exists = connection
+            .query_row("SELECT 1 FROM meetings WHERE id=?1", [meeting_id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(CoreError::NotFound(format!("meeting {meeting_id}")));
+        }
+        let mut statement = connection.prepare(
+            "SELECT t.id,t.start_ms,t.end_ms,
+                    COALESCE(NULLIF(s.display_name,''),'Unknown speaker'),
+                    COALESCE(t.edited_text,t.model_text)
+             FROM transcript_turns t
+             LEFT JOIN meeting_speakers s ON s.id=t.speaker_id
+             WHERE t.meeting_id=?1 AND t.is_draft=0
+             ORDER BY t.start_ms,t.id",
+        )?;
+        let turns = statement
+            .query_map([meeting_id], |row| {
+                Ok(AgentContextTurn {
+                    turn_id: row.get(0)?,
+                    start_ms: row.get(1)?,
+                    end_ms: row.get(2)?,
+                    speaker_name: row.get(3)?,
+                    text: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(turns)
+    }
+
+    pub fn list_transcript_chat(
+        &self,
+        meeting_id: &str,
+        limit: u32,
+    ) -> CoreResult<Vec<TranscriptChatMessage>> {
+        validate_id(meeting_id, "meeting")?;
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT id,meeting_id,role,content,citations_json,model,created_at_ms
+             FROM transcript_chat_messages
+             WHERE meeting_id=?1
+             ORDER BY created_at_ms DESC,id DESC
+             LIMIT ?2",
+        )?;
+        let mut messages = statement
+            .query_map(params![meeting_id, limit.clamp(1, 200)], map_chat_message)?
+            .collect::<Result<Vec<_>, _>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    pub fn save_transcript_chat_message(
+        &self,
+        meeting_id: &str,
+        role: &str,
+        content: String,
+        citations: Vec<TranscriptCitation>,
+        model: Option<String>,
+    ) -> CoreResult<TranscriptChatMessage> {
+        validate_id(meeting_id, "meeting")?;
+        if !matches!(role, "user" | "assistant") {
+            return Err(CoreError::InvalidInput("invalid chat message role".into()));
+        }
+        let content = content.trim();
+        if content.is_empty() || content.chars().count() > 8_000 {
+            return Err(CoreError::InvalidInput(
+                "chat message must be between 1 and 8000 characters".into(),
+            ));
+        }
+        let id = Uuid::now_v7().to_string();
+        let created_at_ms = now_ms();
+        let citations_json = serde_json::to_string(&citations)?;
+        let connection = self.database.connect()?;
+        connection.execute(
+            "INSERT INTO transcript_chat_messages(
+                id,meeting_id,role,content,citations_json,model,created_at_ms
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                meeting_id,
+                role,
+                content,
+                citations_json,
+                model,
+                created_at_ms
+            ],
+        )?;
+        Ok(TranscriptChatMessage {
+            id,
+            meeting_id: meeting_id.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            citations,
+            model,
+            created_at_ms,
+        })
+    }
+
+    pub fn clear_transcript_chat(&self, meeting_id: &str) -> CoreResult<()> {
+        validate_id(meeting_id, "meeting")?;
+        let connection = self.database.connect()?;
+        connection.execute(
+            "DELETE FROM transcript_chat_messages WHERE meeting_id=?1",
+            [meeting_id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_transcript_turn(
         &self,
         turn_id: &str,
@@ -1677,6 +1790,22 @@ fn numbered_unknown_name(display_name: &str) -> Option<u32> {
         .filter(|number| *number > 0)
 }
 
+fn map_chat_message(row: &Row<'_>) -> rusqlite::Result<TranscriptChatMessage> {
+    let citations_json: String = row.get(4)?;
+    let citations = serde_json::from_str(&citations_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(TranscriptChatMessage {
+        id: row.get(0)?,
+        meeting_id: row.get(1)?,
+        role: row.get(2)?,
+        content: row.get(3)?,
+        citations,
+        model: row.get(5)?,
+        created_at_ms: row.get(6)?,
+    })
+}
+
 fn map_turn_without_words(row: &Row<'_>) -> rusqlite::Result<TranscriptTurn> {
     let model_text: String = row.get(5)?;
     let edited_text: Option<String> = row.get(6)?;
@@ -2041,6 +2170,61 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let service = CoreService::open(temp.path()).unwrap();
         (temp, service)
+    }
+
+    #[test]
+    fn transcript_chat_round_trip_preserves_grounded_citations() {
+        let (_temp, service) = service();
+        let meeting_id = new_id();
+        let now = now_ms();
+        service
+            .database
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO meetings(id,title,source_kind,status,created_at_ms)
+                 VALUES (?1,'Agent chat','import','ready',?2)",
+                params![meeting_id, now],
+            )
+            .unwrap();
+
+        service
+            .save_transcript_chat_message(
+                &meeting_id,
+                "user",
+                "What was decided?".into(),
+                Vec::new(),
+                Some("local-model".into()),
+            )
+            .unwrap();
+        let citation = TranscriptCitation {
+            turn_id: "turn-1".into(),
+            start_ms: 3_000,
+            end_ms: 4_000,
+            speaker_name: "Maya".into(),
+            snippet: "Ship on Friday.".into(),
+        };
+        service
+            .save_transcript_chat_message(
+                &meeting_id,
+                "assistant",
+                "The team decided to ship on Friday.".into(),
+                vec![citation.clone()],
+                Some("local-model".into()),
+            )
+            .unwrap();
+
+        let messages = service.list_transcript_chat(&meeting_id, 100).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].citations, vec![citation]);
+        assert_eq!(messages[1].model.as_deref(), Some("local-model"));
+
+        service.clear_transcript_chat(&meeting_id).unwrap();
+        assert!(service
+            .list_transcript_chat(&meeting_id, 100)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

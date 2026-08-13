@@ -215,6 +215,9 @@ fn run(inner_arguments: &[std::ffi::OsString]) -> Result<(), String> {
                 .join("runtime-manifest.json")
                 .is_file()
             || !temporary.join("install-runtime.ps1").is_file()
+            || !temporary.join("preflight-runtime.ps1").is_file()
+            || !temporary.join("verify-worker-runtime.ps1").is_file()
+            || !temporary.join("dependencies.json").is_file()
         {
             return Err("Setup payload is incomplete.".to_string());
         }
@@ -241,7 +244,7 @@ fn main() {
         .any(|argument| argument.eq_ignore_ascii_case("/S"));
     if !silent {
         message(
-            "SayTrace Setup will unpack the included offline processing runtime, then open the normal installer. This can take a minute.",
+            "SayTrace Setup will unpack and verify its offline processing runtime, then check Windows, storage, GPU capability, Ollama, and a local agent model before installing. A clean machine may download Ollama and a 2.5 GB starter model.",
             false,
         );
     }

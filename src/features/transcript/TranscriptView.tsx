@@ -35,14 +35,17 @@ import type {
   Meeting,
   MeetingSpeaker,
   Marker,
+  LocalAgentStatus,
   ProcessingJob,
   SpeakerState,
+  TranscriptChatMessage,
   TranscriptTurn,
   VoiceProfile,
 } from "../../types";
 import { SpeakerAvatar } from "../../components/SpeakerAvatar";
 import { TranscriptRows } from "../../components/TranscriptRows";
 import { Waveform } from "../../components/Waveform";
+import { TranscriptAssistantPanel } from "./TranscriptAssistantPanel";
 
 type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
 
@@ -56,6 +59,10 @@ interface TranscriptViewProps {
   processingJob?: ProcessingJob;
   profiles: VoiceProfile[];
   profileSampleTargetId?: string;
+  chatMessages: TranscriptChatMessage[];
+  agentStatus: LocalAgentStatus;
+  agentLoading: boolean;
+  agentError?: string;
   onUpdateTurn: (turnId: string, editedText: string) => void;
   onToggleMarker: (turnId: string) => void;
   onToggleTurnReview: (turnId: string) => void;
@@ -71,6 +78,9 @@ interface TranscriptViewProps {
     newProfileName?: string,
   ) => Promise<void>;
   onExport: (format: ExportFormat) => void;
+  onAskTranscript: (question: string, model?: string) => Promise<void>;
+  onClearTranscriptChat: () => Promise<void>;
+  onRefreshAgentStatus: () => Promise<void>;
 }
 
 const pipelineSteps = [
@@ -287,6 +297,10 @@ export function TranscriptView({
   processingJob,
   profiles,
   profileSampleTargetId,
+  chatMessages,
+  agentStatus,
+  agentLoading,
+  agentError,
   onUpdateTurn,
   onToggleMarker,
   onToggleTurnReview,
@@ -298,6 +312,9 @@ export function TranscriptView({
   onRetryJob,
   onConfirmVoiceSample,
   onExport,
+  onAskTranscript,
+  onClearTranscriptChat,
+  onRefreshAgentStatus,
 }: TranscriptViewProps) {
   const [search, setSearch] = useState("");
   const [playing, setPlaying] = useState(false);
@@ -319,6 +336,7 @@ export function TranscriptView({
   const [replaceText, setReplaceText] = useState("");
   const [renamingMeeting, setRenamingMeeting] = useState(false);
   const [meetingTitleDraft, setMeetingTitleDraft] = useState(meeting.title);
+  const [sidePanel, setSidePanel] = useState<"ask" | "speakers">("ask");
   const searchRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptScrollRef = useRef<HTMLElement>(null);
@@ -815,10 +833,54 @@ export function TranscriptView({
           />
         </section>
         <aside
-          className="speaker-panel"
-          aria-label="Meeting speakers"
+          className={`speaker-panel ${
+            sidePanel === "ask" ? "speaker-panel--assistant" : ""
+          }`}
+          aria-label={sidePanel === "ask" ? "Ask this transcript" : "Meeting speakers"}
           ref={speakerPanelRef}
         >
+          {sidePanel === "ask" ? (
+            <TranscriptAssistantPanel
+              meetingTitle={meeting.title}
+              messages={chatMessages}
+              status={agentStatus}
+              loading={agentLoading}
+              error={agentError}
+              transcriptReady={meeting.status === "ready" && turns.length > 0}
+              onOpenSpeakers={() => setSidePanel("speakers")}
+              onAsk={onAskTranscript}
+              onClear={onClearTranscriptChat}
+              onRefreshStatus={onRefreshAgentStatus}
+              onOpenCitation={(citation) => {
+                setSelectedTurn(citation.turnId);
+                seekTo(citation.startMs);
+                window.setTimeout(() => {
+                  transcriptScrollRef.current
+                    ?.querySelector(`[data-turn-id="${citation.turnId}"]`)
+                    ?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+                }, 0);
+              }}
+            />
+          ) : (
+            <>
+          <div className="side-panel-tabs" role="tablist" aria-label="Transcript tools">
+            <button
+              type="button"
+              role="tab"
+              aria-selected="false"
+              onClick={() => setSidePanel("ask")}
+            >
+              Ask
+            </button>
+            <button
+              type="button"
+              className="is-active"
+              role="tab"
+              aria-selected="true"
+            >
+              Speakers
+            </button>
+          </div>
           <div className="panel-heading">
             <h2>Speakers</h2>
             <ChevronDown size={18} />
@@ -939,6 +1001,8 @@ export function TranscriptView({
               strict match thresholds.
             </p>
           </div>
+            </>
+          )}
         </aside>
       </div>
 

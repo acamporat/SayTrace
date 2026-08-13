@@ -224,6 +224,65 @@ pub struct TranscriptSearchHit {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptCitation {
+    pub turn_id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub speaker_name: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptChatMessage {
+    pub id: String,
+    pub meeting_id: String,
+    pub role: String,
+    pub content: String,
+    pub citations: Vec<TranscriptCitation>,
+    pub model: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalAgentModel {
+    pub name: String,
+    pub parameter_size: Option<String>,
+    pub quantization_level: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalAgentStatus {
+    pub state: String,
+    pub backend: String,
+    pub endpoint: String,
+    pub selected_model: Option<String>,
+    pub models: Vec<LocalAgentModel>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskTranscriptRequest {
+    pub meeting_id: String,
+    pub question: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentContextTurn {
+    pub turn_id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub speaker_name: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTurnRequest {
