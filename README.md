@@ -1,11 +1,12 @@
 # SayTrace
 
-SayTrace is a cross-platform desktop application for private meeting capture,
-audio/video transcription, and conservative speaker identification. Windows
-uses NVIDIA CUDA when available; Apple Silicon Macs use MLX/Metal. Microphone
-and system audio are recorded locally as separate sources, live captions are
-treated as disposable drafts, and the canonical transcript is rebuilt from the
-saved media after recording stops.
+SayTrace is a desktop application for private meeting capture, audio/video
+transcription, and conservative speaker identification on Windows 11 x64 and
+Apple Silicon Macs running macOS 15 or newer. Windows uses NVIDIA CUDA when
+available; Apple Silicon Macs use MLX/Metal. Microphone and system audio are
+recorded locally as separate sources, live captions are treated as disposable
+drafts, and the canonical transcript is rebuilt from the saved media after
+recording stops.
 
 The application does not use a cloud transcription service. It enables network
 access only during explicit model setup for the revision-pinned files declared by
@@ -53,7 +54,7 @@ sends transcript text to a hosted model.
 ### Windows
 
 - Windows 11 x64
-- Node.js 22 and npm
+- Node.js 22 and npm 10.9.8
 - Rust 1.88+ with the MSVC Windows target
 - Python 3.13 managed through [uv](https://docs.astral.sh/uv/)
 - FFmpeg and FFprobe for development imports
@@ -61,7 +62,7 @@ sends transcript text to a hosted model.
 ### macOS Apple Silicon development
 
 The macOS port targets Apple Silicon on macOS 15+ and uses Apple
-MLX/Metal for speech recognition instead of NVIDIA CUDA. Install Node.js 22,
+MLX/Metal for speech recognition instead of NVIDIA CUDA. Install Node.js 22 with npm 10.9.8,
 Rust 1.88+, `uv`, FFmpeg/FFprobe, and the Xcode command-line tools, then run:
 
 ```bash
@@ -72,17 +73,27 @@ uv sync --project worker --extra ml --group dev
 
 The Codex **Run** action uses that same build-and-run script. macOS will request
 Microphone and Screen & System Audio Recording access the first time recording
-is used. See [macOS development](docs/macos.md) for setup, permissions, checks,
-debug/log modes, and the current packaging limitations.
+is used. See [macOS development and release](docs/macos.md) for setup,
+permissions, checks, debug/log modes, and the canonical release workflow.
 
 The normal macOS run path is release-optimized. When live captions are off,
-SayTrace prewarms the final MLX and diarization models during recording, keeps
-heavy backends in a hardware-adaptive resident cache between jobs, and releases
-idle entries after two to ten minutes. On 8 GB Macs, inference returns to
-stage-bounded model release and prewarms final ASR only. Final media
-normalization and track consolidation use bounded parallelism, while the
-renderer avoids high-frequency React updates for meters, playback, and large
-transcripts.
+SayTrace prewarms the final MLX model during recording and, on Macs with more
+than 16 GB of unified memory, prewarms diarization too. Heavy backends use a
+hardware-adaptive resident cache whose idle entries expire after two to ten
+minutes. Macs with 16 GB or less unload each heavyweight backend after its
+pipeline stage so MLX and PyTorch do not compete for the same unified-memory
+working set. Final media normalization and track consolidation use bounded
+parallelism, while the renderer avoids high-frequency React updates for meters,
+playback, and large transcripts.
+
+macOS candidates are Apple Development-signed and explicitly unnotarized. The
+official path separately prepares a Developer ID-signed, notarized, and stapled
+DMG, binds clean-Mac physical acceptance to that installer's exact SHA-256
+digest, and finalizes the accepted bytes. Only `artifacts/macos/v<version>`
+created by the finalizer is publishable. Model weights are not bundled; they
+remain revision-pinned, hash-verified first-run downloads. See the
+[SayTrace 0.3.0 release notes](docs/releases/v0.3.0.md) for current distribution
+status and blockers.
 
 The Windows production installer includes the locked Python worker, NVIDIA CUDA
 runtime with CPU fallback, LGPL-compatible FFmpeg, and automatic WebView2

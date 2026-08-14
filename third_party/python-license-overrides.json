@@ -1,0 +1,35 @@
+{
+  "packages": [
+    {
+      "attribution_file": "third_party/licenses/python/mlx-whisper-0.4.3/SOURCE.md",
+      "attribution_sha256": "3b3bc986f419a3e5bff0b8a1fcac6edb79cbd91dbaa0fa4137b215258a4cacfb",
+      "distribution_filename": "mlx_whisper-0.4.3-py3-none-any.whl",
+      "distribution_sha256": "6b82b6597a994643a3e5496c7bc229a672e5ca308458455bfe276e76ae024489",
+      "license": "MIT",
+      "license_file": "third_party/licenses/python/mlx-whisper-0.4.3/LICENSE",
+      "license_sha256": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01",
+      "license_url": "https://raw.githubusercontent.com/ml-explore/mlx-examples/bf921afcbef89463c2b8a78c4008d993500fadb4/LICENSE",
+      "name": "mlx-whisper",
+      "package_index_url": "https://pypi.org/pypi/mlx-whisper/0.4.3/json",
+      "source_revision": "bf921afcbef89463c2b8a78c4008d993500fadb4",
+      "source_url": "https://github.com/ml-explore/mlx-examples",
+      "version": "0.4.3"
+    },
+    {
+      "attribution_file": "third_party/licenses/python/primePy-1.3/SOURCE.md",
+      "attribution_sha256": "afd445181a574ed4c02f5b0a81bcac8593d22925f8c7e86b47a1c819a5643d08",
+      "distribution_filename": "primePy-1.3-py3-none-any.whl",
+      "distribution_sha256": "5ed443718765be9bf7e2ff4c56cdff71b42140a15b39d054f9d99f0009e2317a",
+      "license": "MIT",
+      "license_file": "third_party/licenses/python/primePy-1.3/LICENSE",
+      "license_sha256": "1a06a1576544095ade4508462bc6c795c874a499e2abe12d21557e85a3741d9e",
+      "license_url": "https://raw.githubusercontent.com/janaindrajit/primePy/ee9cc1666bdd6e1e2984ad10d307213e481c937b/LICENSE",
+      "name": "primePy",
+      "package_index_url": "https://pypi.org/pypi/primePy/1.3/json",
+      "source_revision": "ee9cc1666bdd6e1e2984ad10d307213e481c937b",
+      "source_url": "https://github.com/janaindrajit/primePy",
+      "version": "1.3"
+    }
+  ],
+  "schema_version": 1
+}

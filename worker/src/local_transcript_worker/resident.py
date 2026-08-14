@@ -31,13 +31,17 @@ class ResidentCachePolicy:
 
     @property
     def stage_bounded_release(self) -> bool:
-        return not self.enabled or self.memory_tier == "low"
+        return (
+            not self.enabled
+            or self.physical_memory_bytes is None
+            or self.physical_memory_bytes <= 16 * _GIBIBYTE
+        )
 
     @property
     def prewarm_components(self) -> tuple[str, ...]:
         if not self.enabled:
             return ()
-        if self.memory_tier == "low":
+        if self.stage_bounded_release:
             return ("final_asr",)
         return ("final_asr", "diarization", "speaker_embedding")
 

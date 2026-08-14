@@ -344,7 +344,7 @@ def test_non_apple_platform_uses_nonresident_stage_release_policy(
 
 @pytest.mark.parametrize(
     ("memory_gib", "release_after_stage"),
-    [(8, True), (16, False)],
+    [(8, True), (16, True), (24, False)],
 )
 def test_apple_pipeline_applies_memory_tier_stage_release_policy(
     tmp_path: Path,

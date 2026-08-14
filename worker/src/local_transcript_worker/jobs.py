@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from collections.abc import Callable
@@ -12,6 +13,7 @@ from .schema import JsonObject
 
 JobCallable = Callable[[threading.Event], JsonObject]
 EventCallback = Callable[[str, JsonObject], None]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -74,6 +76,7 @@ class JobManager:
             except WorkerError as exc:
                 self.emit("job_error", {"job_id": job.job_id, "error": exc.as_dict()})
             except Exception as exc:
+                LOGGER.exception("Unhandled pipeline failure")
                 self.emit(
                     "job_error",
                     {

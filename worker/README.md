@@ -66,13 +66,14 @@ stage-by-stage backend teardown to bound peak VRAM/RAM.
 `diarization`, or `speaker_embedding` components into the resident cache. It is
 intended to hide model loading beneath recording time when live captions are off;
 completion or failure arrives as a `performance_prewarm_*` event. The cache
-adapts to unified memory: an 8 GiB Mac retains at most two variants for two idle
-minutes, sub-16 GiB systems retain four for five minutes, and 16 GiB or larger
-systems retain six to eight for at most ten minutes. The chosen bounded policy is
-reported through `health`. On the 8 GiB tier, prewarm loads only final ASR and
-each heavyweight backend is unloaded when its pipeline stage finishes, bounding
-the active model working set. Macs with 16 GiB or more preserve the complete warm
-final-ASR, diarization, and speaker-embedding set for the lower repeat-job latency.
+adapts to unified memory: an 8 GiB Mac retains at most two cache entries for two
+idle minutes, sub-16 GiB systems retain four for five minutes, and 16 GiB or
+larger systems retain six to eight for at most ten minutes. The chosen bounded
+policy is reported through `health`. On Macs with 16 GiB or less, prewarm loads
+only final ASR and each heavyweight backend is unloaded when its pipeline stage
+finishes, bounding the active model working set even though its lightweight
+cache entry remains. Macs with more than 16 GiB preserve the complete warm
+final-ASR, diarization, and speaker-embedding set for lower repeat-job latency.
 `performance.release` explicitly evicts selected idle components. In-use models
 are lease-protected and cannot be released by either command or the idle reaper.
 

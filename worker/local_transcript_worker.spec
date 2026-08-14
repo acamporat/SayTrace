@@ -57,7 +57,7 @@ def runtime_hidden_imports_only(items):
     return [name for name in items if not any(part in name for part in excluded)]
 
 
-common_packages = (
+windows_common_packages = (
     "huggingface_hub",
     "numpy",
     "pyannote.audio",
@@ -77,29 +77,55 @@ windows_packages = (
     "whisperx",
 )
 
-# MLX and pyannote both load portions of their stacks dynamically. Explicitly
-# collect those packages so the arm64 onedir runtime does not depend on the
-# developer virtual environment after it is copied into the app bundle.
+# MLX Whisper loads model code and assets dynamically, while Numba discovers
+# compiled support modules at runtime. PyInstaller's maintained hooks and the
+# pinned hidden imports below cover the remaining scientific stack without a
+# second collect_all traversal of every package namespace.
 macos_packages = (
-    "asteroid_filterbanks",
-    "lightning",
     "mlx",
     "mlx_whisper",
     "numba",
-    "pyannote.database",
-    "pyannote.metrics",
-    "pyannote.pipeline",
-    "pytorch_lightning",
-    "pytorch_metric_learning",
-    "scipy",
-    "tiktoken",
-    "torch_audiomentations",
-    "torch_pitch_shift",
-    "torchmetrics",
 )
 
-platform_packages = windows_packages if is_windows else macos_packages
-for package in (*common_packages, *platform_packages):
+if is_windows:
+    collected_packages = (*windows_common_packages, *windows_packages)
+    excluded_packages = []
+else:
+    # Let PyInstaller's platform hooks collect the imported NumPy/PyTorch
+    # runtime surface. collect_all(torch) traverses distributed, compiler,
+    # training, testing, and CUDA-only namespaces that the local inference
+    # worker never executes. TorchCodec is deliberately omitted: SayTrace
+    # supplies decoded waveforms to pyannote, and TorchCodec's macOS binaries
+    # require incompatible shared FFmpeg 4-7 libraries.
+    collected_packages = macos_packages
+    excluded_packages = [
+        "av",
+        "ctranslate2",
+        "faster_whisper",
+        "pytorch_lightning",
+        "pytorch_metric_learning",
+        "pytest",
+        "tokenizers",
+        "torchcodec",
+        "whisperx",
+    ]
+    hiddenimports += [
+        "pyannote.audio.models.embedding.wespeaker",
+        "pyannote.audio.models.segmentation.PyanNet",
+        "pyannote.audio.pipelines.clustering",
+        "pyannote.audio.pipelines.speaker_diarization",
+        "pyannote.audio.pipelines.speaker_verification",
+        "safetensors.mlx",
+        "safetensors.torch",
+    ]
+    # Pyannote reads this package-data file unconditionally while importing
+    # its telemetry module, even when metrics are disabled for offline use.
+    datas += collect_data_files(
+        "pyannote.audio",
+        includes=["telemetry/config.yaml"],
+    )
+
+for package in collected_packages:
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += runtime_data_only(package_datas)
     binaries += package_binaries
@@ -122,7 +148,7 @@ analysis = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excluded_packages,
     noarchive=False,
     optimize=1,
 )

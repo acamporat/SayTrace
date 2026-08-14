@@ -14,6 +14,10 @@ Key runtime components include:
   the pinned quantized Whisper model repositories are declared in
   `worker/model-manifest.macos.json` and remain subject to their own notices and
   license terms.
+- `mlx-whisper` 0.4.3 and `primePy` 1.3 are MIT-licensed. Their published
+  distributions omit license files, so reviewed upstream license texts and
+  source attribution are pinned under `third_party/licenses/python/` and copied
+  into every official release notice bundle.
 
 The authoritative repository/revision/license lists are
 `worker/model-manifest.json` and `worker/model-manifest.macos.json`. A production

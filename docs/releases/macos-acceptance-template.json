@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "product": "SayTrace macOS physical acceptance",
+  "version": "REPLACE_WITH_RELEASE_VERSION",
+  "source_revision": "REPLACE_WITH_FULL_GIT_COMMIT",
+  "installer": {
+    "name": "REPLACE_WITH_PREPARED_DMG_NAME",
+    "size": 0,
+    "sha256": "REPLACE_WITH_PREPARED_DMG_SHA256"
+  },
+  "performed_at_utc": "REPLACE_WITH_ISO_8601_UTC_TIMESTAMP",
+  "hardware": {
+    "architecture": "arm64",
+    "model_identifier": "REPLACE_WITH_MAC_MODEL_IDENTIFIER",
+    "macos_version": "REPLACE_WITH_MACOS_VERSION"
+  },
+  "checks": {
+    "installer_sha256_verified_on_test_mac": "not_run",
+    "clean_mac_install_and_first_run": "not_run",
+    "microphone_only_repeated_capture": "not_run",
+    "system_audio_only_repeated_capture": "not_run",
+    "combined_capture_repeated_capture": "not_run",
+    "permission_grant_denial_reset_revocation": "not_run",
+    "combined_wav_nonempty_and_channels_verified": "not_run",
+    "pause_resume_stop_writer_finalization": "not_run",
+    "long_combined_capture_soak": "not_run",
+    "av_clock_alignment": "not_run",
+    "no_new_diagnostic_crash_report": "not_run"
+  },
+  "operator_confirmation": false
+}

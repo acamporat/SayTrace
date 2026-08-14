@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import importlib
+import logging
 import math
 import os
 import subprocess
@@ -68,6 +69,7 @@ FallbackCallback = Callable[[str, WorkerError], None]
 ModelLoadCallback = Callable[[str, int], None]
 _WHISPERX_SENTENCE_TOKENIZER_LOCK = threading.Lock()
 _MLX_WHISPER_LOCK = threading.RLock()
+LOGGER = logging.getLogger(__name__)
 
 
 def _accelerator_retryable(error: WorkerError) -> bool:
@@ -1119,6 +1121,8 @@ def _read_wave_window(path: Path, start_ms: int, end_ms: int, np: Any) -> tuple[
 
 
 def _translate_ml_error(exc: Exception, message: str) -> WorkerError:
+    if os.environ.get("SAYTRACE_RELEASE_DIAGNOSTICS") == "1":
+        LOGGER.exception("Release-gate ML backend diagnostic: %s", message)
     text = str(exc).casefold()
     if any(
         marker in text

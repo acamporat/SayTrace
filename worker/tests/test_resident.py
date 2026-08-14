@@ -39,25 +39,50 @@ def test_resident_policy_scales_with_unified_memory(
     assert policy.max_entries == max_entries
     assert policy.idle_seconds == idle_seconds
     assert policy.as_dict()["adaptive"] is True
-    assert policy.stage_bounded_release is (tier == "low")
+    assert policy.stage_bounded_release is (memory_gib <= 16)
     assert policy.prewarm_components == (
-        ("final_asr",) if tier == "low" else ("final_asr", "diarization", "speaker_embedding")
+        ("final_asr",) if memory_gib <= 16 else ("final_asr", "diarization", "speaker_embedding")
     )
 
 
-def test_sixteen_gib_policy_keeps_the_complete_apple_working_set() -> None:
+def test_sixteen_gib_policy_bounds_the_unified_memory_working_set() -> None:
     policy = resident_cache_policy(enabled=True, detected_memory_bytes=16 * GIBIBYTE)
 
-    # MLX final ASR plus preferred/fallback diarization and embedding wrappers
-    # use five entries; only the preferred variants materialize weights.
+    # Keep the fast MLX ASR prewarm, but unload it before Pyannote uses MPS so
+    # the two large accelerator working sets cannot exhaust unified memory.
     assert policy.max_entries >= 5
     assert policy.idle_seconds == 600
+    assert policy.stage_bounded_release is True
+    assert policy.prewarm_components == ("final_asr",)
+
+
+def test_policy_retains_full_warm_set_only_above_sixteen_gib() -> None:
+    policy = resident_cache_policy(
+        enabled=True,
+        detected_memory_bytes=16 * GIBIBYTE + 1,
+    )
+
     assert policy.stage_bounded_release is False
     assert policy.prewarm_components == (
         "final_asr",
         "diarization",
         "speaker_embedding",
     )
+
+
+def test_unknown_memory_policy_fails_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "local_transcript_worker.resident.physical_memory_bytes",
+        lambda: None,
+    )
+
+    policy = resident_cache_policy(enabled=True)
+
+    assert policy.memory_tier == "low"
+    assert policy.stage_bounded_release is True
+    assert policy.prewarm_components == ("final_asr",)
 
 
 def test_resident_policy_preserves_explicit_test_overrides() -> None:

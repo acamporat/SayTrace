@@ -13,7 +13,7 @@ redistributable FFmpeg payload remain release gates.
 
 - Apple Silicon Mac with macOS 15+
 - Xcode with its command-line tools and macOS SDK selected
-- Node.js 22 and npm
+- Node.js 22 and npm 10.9.8 (pinned in `package.json`)
 - Rust 1.88+ with the `aarch64-apple-darwin` target
 - `uv` for the Python 3.13 worker
 - FFmpeg and FFprobe
@@ -160,29 +160,213 @@ Voice-profile secrets are stored through macOS Keychain. Audio, transcripts,
 models, and the SQLite library remain ordinary local files, so use FileVault if
 whole-library encryption at rest is required.
 
-## Package a release candidate
+## macOS release workflow
 
-Build and stage the arm64 PyInstaller worker plus FFmpeg and FFprobe:
+The release flow has three distinct states: a local candidate, an immutable
+notarized installer awaiting physical acceptance, and a finalized release. A
+candidate or prepared installer is not an official release. Only the output of
+the finalization step under `artifacts/macos/v<version>` is publishable.
+
+### Official-release prerequisites
+
+In addition to the development prerequisites above, official preparation and
+finalization require:
+
+- a clean Git worktree at the exact release commit;
+- a private, release-operator-owned checkout whose repository and output
+  directories are not group- or world-writable, with no other build or file
+  mutation process running in that checkout;
+- a current Apple Developer Program membership;
+- a valid **Developer ID Application** certificate and its private key in the
+  signing Mac's Keychain;
+- a validated `notarytool` Keychain profile;
+- enough free space for the build script to create the locked, macOS-15-targeted
+  `worker/.venv-macos` release environment;
+  and
+- all revision-pinned models in the normal SayTrace model directory, or in the
+  directory named by `SAYTRACE_RELEASE_MODEL_ROOT`, so packaged model inference
+  can be tested before notarization.
+
+Create an interactive Keychain profile if needed:
 
 ```bash
-uv sync --project worker --extra ml --group build
-./script/build_worker_macos.sh
-npm run tauri:build -- --config src-tauri/tauri.macos.release.conf.json
+xcrun notarytool store-credentials saytrace-notary
 ```
 
-The runtime is staged under `build/macos-runtime/runtime` with a SHA-256 payload
-manifest, then embedded at `Contents/Resources/runtime` by the release-only
-Tauri configuration. Model weights remain a verified first-run download.
+The candidate and official build commands create `worker/.venv-macos`
+automatically with uv-managed Python 3.13.12 and macOS-15 MLX wheels. This is
+separate from the host-oriented `worker/.venv` used for development, preventing
+newer Homebrew or MLX binaries from silently raising the installer's minimum
+system version. Release verification inspects every embedded Mach-O deployment
+target and rejects anything newer than macOS 15.
 
-The staging script fails closed if it detects GPL/nonfree configuration, a
-non-arm64 executable, or libraries outside macOS system paths. Supply
-self-contained redistributable LGPL-compatible FFmpeg/FFprobe binaries, review
-their license obligations, then sign every nested executable and library with a
-Developer ID. Regenerate `runtime-manifest.json` over those final signed bytes,
-embed the runtime, sign the outer app, and submit the final app or DMG for
-notarization; signing nested code after manifest generation invalidates the
-payload hashes.
+The release script validates that trust boundary, rejects symlinked output
+components, and holds an exclusive checkout-local release lock. These checks
+assume another process running as the same macOS user is not deliberately racing
+path replacement; use a dedicated local checkout rather than a shared CI worktree.
 
-The complete PyInstaller build, nested-code signing, notarization, and
-microphone/system-audio performance and permission acceptance on a clean Mac
-remain release gates.
+Keep Apple credentials in Keychain; do not store them in the repository or a
+shell script. `SAYTRACE_NOTARY_PROFILE` contains only the Keychain profile name.
+The build selects the installed Developer ID Application identity automatically,
+or an exact certificate can be selected with `SAYTRACE_CODESIGN_IDENTITY`.
+
+Model files are a release-time inference-test input, not a bundled payload.
+The DMG contains the self-contained worker and media runtime but no model
+weights. Each installation downloads only the revision-pinned, hash-verified
+weights during explicit first-run setup.
+
+### 1. Build a local candidate
+
+Use candidate mode to exercise packaging before consuming notarization
+submissions:
+
+```bash
+./script/build_macos_release.sh --candidate
+```
+
+If the exact FFmpeg and worker outputs have already been built and verified,
+they can be reused for a faster local iteration:
+
+```bash
+./script/build_macos_release.sh \
+  --candidate \
+  --skip-ffmpeg-build \
+  --skip-worker-build
+```
+
+Candidate mode requires an Apple Development identity. It builds an arm64 app,
+verifies the embedded runtime, generates the legal-notice payload, signs the app
+and DMG for local testing, and writes:
+
+```text
+artifacts/macos/candidates/v0.3.0/
+  SayTrace-0.3.0-macos-arm64-UNNOTARIZED.dmg
+  SayTrace-0.3.0-macos-arm64.release-manifest.json
+  SayTrace-0.3.0-ffmpeg-8.1.2-source.tar.xz
+  SayTrace-0.3.0-ffmpeg-8.1.2-source.tar.xz.asc
+  RELEASE_NOTES.md
+  SHA256SUMS.txt
+```
+
+The `UNNOTARIZED` candidate is for local integration testing only. Do not call
+it official, distribute it as a stable release, tag it, or upload it to a GitHub
+Release.
+
+### 2. Prepare the exact notarized installer
+
+From the clean release commit, run official mode without either skip flag:
+
+```bash
+export SAYTRACE_NOTARY_PROFILE=saytrace-notary
+./script/build_macos_release.sh
+```
+
+Set `SAYTRACE_RELEASE_MODEL_ROOT` first if the verified models are not in the
+default SayTrace application-support directory. Official mode rebuilds and
+verifies the redistributable FFmpeg and worker, requires a successful packaged
+model-inference gate, signs all nested code and the outer app with Developer ID,
+notarizes and staples both the app and DMG, and runs Gatekeeper assessment.
+
+The same command generates the embedded legal-notice payload from the locked
+Node, Rust, and Python dependency graphs plus the exact redistributable FFmpeg
+build. It records sanitized FFmpeg source provenance and includes the available
+license and notice files for every resolved dependency. A Python package without
+distributed legal text stops the build unless its exact package/version has a
+reviewed, hash-pinned entry in
+`third_party/python-license-overrides.json`. Review the generated inventory in
+`build/release-resources/legal` before publication.
+
+The immutable preparation output is:
+
+```text
+artifacts/macos/prepared/v0.3.0/
+  SayTrace-0.3.0-macos-arm64.dmg
+  SayTrace-0.3.0-ffmpeg-8.1.2-source.tar.xz
+  SayTrace-0.3.0-ffmpeg-8.1.2-source.tar.xz.asc
+  RELEASE_NOTES.md
+  prepared-release.json
+  physical-acceptance-template.json
+  .release-state/
+```
+
+The script refuses to overwrite an existing prepared directory. Preserve every
+file exactly as generated. `prepared-release.json` records the installer hash,
+source revision, runtime-manifest hash, and Apple submission IDs, but marks the
+distribution as not official because physical acceptance has not happened.
+This directory is not publishable.
+
+### 3. Accept that exact DMG on a physical Mac
+
+Copy the prepared DMG and its generated
+`physical-acceptance-template.json` to a clean Apple Silicon test Mac without
+renaming or modifying the DMG. Use the generated template, not the generic
+example under `docs/releases`, because it is prefilled with the exact DMG name,
+byte size, SHA-256 digest, version, and source revision.
+
+On the test Mac, independently verify the installer and record the hardware:
+
+```bash
+shasum -a 256 SayTrace-0.3.0-macos-arm64.dmg
+sysctl -n hw.model
+sw_vers -productVersion
+```
+
+The computed digest must exactly match the template. Install from that DMG and
+perform every listed check, including clean first run, repeated microphone-only,
+system-audio-only, and combined capture, permission grant/denial/reset/revocation,
+WAV channel and finalization checks, the combined-capture soak and A/V clock
+check, and the diagnostic-crash-report check. In a copied acceptance JSON:
+
+- replace the UTC timestamp and hardware placeholders;
+- change every check, including
+  `installer_sha256_verified_on_test_mac`, from `not_run` to `passed`; and
+- set `operator_confirmation` to `true`.
+
+Acceptance must describe Apple Silicon on macOS 15 or newer and be no more than
+30 days old when finalized. Testing a rebuilt, renamed, or otherwise different
+DMG does not qualify the prepared installer.
+
+### 4. Finalize the accepted bytes
+
+Return the completed acceptance JSON to the release Mac. Keep the prepared
+directory unchanged, check out the same clean source commit, and run:
+
+```bash
+export SAYTRACE_NOTARY_PROFILE=saytrace-notary
+export SAYTRACE_MACOS_ACCEPTANCE_EVIDENCE=/absolute/path/to/completed-acceptance.json
+./script/finalize_macos_release.sh
+```
+
+Finalization fails closed unless the acceptance record matches the prepared DMG
+by name, size, and SHA-256 digest. It also rechecks the prepared inventory and
+Apple submission status, verifies the signed FFmpeg source inputs, mounts the
+exact DMG read-only, and revalidates Developer ID signatures, stapling,
+Gatekeeper acceptance, bundle identity, architecture, and the embedded runtime.
+It then writes the release atomically to:
+
+```text
+artifacts/macos/v0.3.0/
+  SayTrace-0.3.0-macos-arm64.dmg
+  SayTrace-0.3.0-macos-arm64.release-manifest.json
+  SayTrace-0.3.0-ffmpeg-8.1.2-source.tar.xz
+  SayTrace-0.3.0-ffmpeg-8.1.2-source.tar.xz.asc
+  SayTrace-0.3.0-macos-physical-acceptance.json
+  RELEASE_NOTES.md
+  SHA256SUMS.txt
+```
+
+Only this finalized seven-file directory is eligible for a stable tag or public
+release. Do not publish files from `candidates`, `prepared`, `.release-state`,
+`build`, or the Tauri bundle directory. Finalization does not create a Git tag
+or GitHub Release; those remain separate, explicit publication actions after
+the finalized checksums and manifest have been reviewed.
+
+### Current distribution blocker
+
+The current release Mac has an Apple Development identity but no Developer ID
+Application identity or configured `notarytool` profile, so it can produce a
+candidate but cannot complete official preparation. An Apple
+Development-signed candidate does not satisfy the official flow. Even after
+those Apple credentials are available and notarization succeeds, the release
+must remain unpublished until the exact prepared DMG passes the physical Mac
+checks and `finalize_macos_release.sh` creates the final directory.

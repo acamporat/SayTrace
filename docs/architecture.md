@@ -84,8 +84,9 @@ deadlines instead of polling SQLite while idle.
 - Messages and live queues are bounded, heartbeats are supervised, and no network port is opened.
 - Heavy inference backends are lease-protected in a bounded resident cache.
   macOS prewarms final ASR and diarization beneath recording time when live
-  captions are disabled; idle entries are evicted after a hardware-adaptive two
-  to ten minutes and can be released explicitly. The 8 GB policy prewarms only
+  captions are disabled when the unified-memory policy permits both; idle
+  entries are evicted after a hardware-adaptive two to ten minutes and can be
+  released explicitly. On Macs with 16 GB or less, the policy prewarms only
   final ASR and unloads each heavyweight backend after its stage to limit peak
   unified-memory use.
 - Protocol and pipeline compatibility are checked during the worker `hello`

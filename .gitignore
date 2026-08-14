@@ -12,6 +12,7 @@ target/
 # Python
 .venv/
 worker/.venv/
+worker/.venv-macos/
 __pycache__/
 *.py[cod]
 .pytest_cache/
