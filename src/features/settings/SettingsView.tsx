@@ -137,8 +137,11 @@ export function SettingsView({
               <Cpu size={20} />
             </span>
             <div>
-              <strong>GPU acceleration</strong>
-              <p>Use the NVIDIA GPU when available, with automatic CPU fallback.</p>
+              <strong>Apple Silicon acceleration</strong>
+              <p>
+                Use MLX and Metal for transcription, with MPS or CPU fallback
+                for speaker processing.
+              </p>
             </div>
             <span className="settings-value">Automatic</span>
           </div>
@@ -179,9 +182,9 @@ export function SettingsView({
             </span>
             <div>
               <strong>Managed library</strong>
-              <p>%LOCALAPPDATA%\com.localtranscript.desktop\library</p>
+              <p>SayTrace data in your Library/Application Support folder</p>
             </div>
-            <span className="settings-value">App data</span>
+            <span className="settings-value">Application Support</span>
           </div>
           <div className="settings-row">
             <span className="settings-row__icon">
@@ -226,9 +229,9 @@ export function SettingsView({
               </p>
             </div>
           </div>
-          <p className="bitlocker-note">
-            <Info size={17} /> For full-library encryption, enable BitLocker on
-            this Windows drive.
+          <p className="storage-encryption-note">
+            <Info size={17} /> For full-library encryption, turn on FileVault
+            for this Mac.
           </p>
         </section>
       </div>

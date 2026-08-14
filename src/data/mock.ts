@@ -340,7 +340,7 @@ export const devices: AudioDevice[] = [
   },
   {
     id: "mic-array",
-    name: "Microphone — Realtek Array",
+    name: "Microphone — MacBook Pro Microphone",
     kind: "input",
     isDefault: false,
   },
@@ -363,7 +363,7 @@ export const modelStatus: ModelPackStatus = {
   liveModel: "ready",
   finalModel: "ready",
   diarizationModel: "ready",
-  device: "NVIDIA GeForce RTX 2080 Ti",
+  device: "Apple MLX (Metal)",
   diskRequiredGb: 12.4,
   diskAvailableGb: 128.4,
 };

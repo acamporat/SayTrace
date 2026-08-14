@@ -16,6 +16,9 @@ local-transcript-worker.exe `
   --ffmpeg C:\path\to\ffmpeg.exe
 ```
 
+On macOS the executable names have no `.exe` suffix and normal paths use POSIX
+syntax; the framing and security contract are identical.
+
 This mode sets the Hugging Face/Transformers offline flags, disables telemetry, and
 blocks DNS and IP socket connections in-process. Model setup is a separate, explicit
 launch with `--allow-model-downloads`. `model.install` accepts a Hugging Face token in
@@ -23,8 +26,9 @@ that process only, downloads the exact revision and allow-listed files to a stag
 directory, verifies every file with SHA-256, atomically publishes it, and does not
 persist the token.
 
-The manifest is `model-manifest.json`. Every model is pinned by a 40-character
-repository revision and every required byte is pinned by size and SHA-256.
+The Windows manifest is `model-manifest.json`; Apple Silicon uses
+`model-manifest.macos.json`. Every model is pinned by a 40-character repository
+revision and every required byte is pinned by size and SHA-256.
 
 ## Framing
 
@@ -53,7 +57,24 @@ JSON requests use:
 ```
 
 Commands are `ping`, `health`, `model.status`, `model.verify`, `model.install`,
-`live.start`, `live.stop`, `pipeline.run`, `pipeline.cancel`, and `shutdown`.
+`performance.prewarm`, `performance.release`, `live.start`, `live.stop`,
+`pipeline.run`, `pipeline.cancel`, and `shutdown`. Resident-cache commands are
+advertised only by the Apple Silicon worker; other platforms preserve strict
+stage-by-stage backend teardown to bound peak VRAM/RAM.
+
+`performance.prewarm` asynchronously loads any selected `final_asr`,
+`diarization`, or `speaker_embedding` components into the resident cache. It is
+intended to hide model loading beneath recording time when live captions are off;
+completion or failure arrives as a `performance_prewarm_*` event. The cache
+adapts to unified memory: an 8 GiB Mac retains at most two variants for two idle
+minutes, sub-16 GiB systems retain four for five minutes, and 16 GiB or larger
+systems retain six to eight for at most ten minutes. The chosen bounded policy is
+reported through `health`. On the 8 GiB tier, prewarm loads only final ASR and
+each heavyweight backend is unloaded when its pipeline stage finishes, bounding
+the active model working set. Macs with 16 GiB or more preserve the complete warm
+final-ASR, diarization, and speaker-embedding set for the lower repeat-job latency.
+`performance.release` explicitly evicts selected idle components. In-use models
+are lease-protected and cannot be released by either command or the idle reaper.
 
 `live.start` payload:
 
@@ -124,14 +145,18 @@ Only the private terminal `job_complete.payload.result` may include transient
 vector encoded as standard Base64 over little-endian float32 bytes. Candidates are
 bounded and omitted when no clean embedding is available. Embeddings never appear in
 progress/batch events, checkpoints, index artifacts, or the canonical final artifact;
-the Rust host validates, DPAPI-encrypts, and persists any explicitly confirmed vector.
+the Rust host validates, encrypts, and persists any explicitly confirmed vector
+using Windows DPAPI or a Keychain-held macOS key.
 
-ASR commits deterministic 10-minute core batches with 5 seconds of audio overlap,
-so restart continues at the next incomplete batch with context. GPU OOM recovery
-releases model state and retries CUDA FP16 at batch sizes 8 then 2, CUDA
-`int8_float16`, and finally CPU int8. CTranslate2 and PyTorch select CUDA
-independently, allowing diarization to fall back to CPU when its CUDA backend
-cannot initialize. Both backends ship inside the normal SayTrace installer.
+ASR commits deterministic ten-minute core batches with 5 seconds of audio
+overlap, so restart continues at the next incomplete batch with context while
+keeping Apple unified-memory peaks bounded. On macOS, MLX Whisper supplies live
+and final ASR plus native word timestamps; pyannote and WeSpeaker use PyTorch MPS
+with CPU fallback. Windows retains its CTranslate2/WhisperX CUDA cascade and CPU
+fallback. Independent source normalization uses at most two concurrent FFmpeg
+processes while publishing checkpoints and errors in deterministic source order.
+`performance_timing` events report stage and model-load durations without audio,
+transcript text, model paths, or voice embeddings.
 
 ## Development
 

@@ -3,9 +3,10 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
+use parking_lot::{Condvar, Mutex};
 use rusqlite::{backup::Backup, params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::json;
@@ -14,16 +15,22 @@ use uuid::Uuid;
 use crate::{
     db::{iso_from_ms, now_ms, Database, SCHEMA_VERSION},
     error::{CoreError, CoreResult},
-    layout::{managed_directory_size, remove_managed_child_tree, runtime_payload_ready, AppLayout},
+    layout::{managed_directory_size, remove_managed_child_tree, AppLayout},
     media,
     media_tools::{self, MediaTool},
     models::*,
+    performance::PerformanceSpan,
 };
 
 const DEFAULT_PROFILE_COLORS: &[&str] = &[
     "#6E8BFF", "#E9779D", "#37B4A3", "#E7A53C", "#A47BE8", "#5E9FDC",
 ];
 const MAX_ASSET_CHUNK: u32 = 4 * 1024 * 1024;
+const LIBRARY_SIZE_CACHE_TTL: Duration = Duration::from_secs(3);
+#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "macos")]
+const MODEL_MANIFEST_JSON: &str = include_str!("../../worker/model-manifest.macos.json");
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const MODEL_MANIFEST_JSON: &str = include_str!("../../worker/model-manifest.json");
 pub(crate) const VOICE_PROFILE_MIN_SAMPLES: i64 = 1;
 pub(crate) const VOICE_PROFILE_MIN_CLEAN_DURATION_MS: i64 = 10_000;
@@ -51,13 +58,33 @@ struct BundledModelFile {
 pub struct CoreService {
     layout: AppLayout,
     database: Database,
+    processing_queue: ProcessingQueueSignal,
+    library_size_cache: Mutex<Option<(Instant, u64)>>,
+}
+
+#[derive(Debug, Default)]
+struct ProcessingQueueSignal {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+#[derive(Debug)]
+pub(crate) struct StartupRecoveryScope {
+    captured_at_ms: i64,
+    recording_session_ids: BTreeSet<String>,
+    recording_meeting_ids: BTreeSet<String>,
 }
 
 impl CoreService {
     pub fn open(root: impl Into<PathBuf>) -> CoreResult<Self> {
         let layout = AppLayout::create(root)?;
         let database = Database::open(layout.database())?;
-        Ok(Self { layout, database })
+        Ok(Self {
+            layout,
+            database,
+            processing_queue: ProcessingQueueSignal::default(),
+            library_size_cache: Mutex::new(None),
+        })
     }
 
     pub fn open_with_runtime(
@@ -66,7 +93,26 @@ impl CoreService {
     ) -> CoreResult<Self> {
         let layout = AppLayout::create_with_runtime(root, Some(bundled_runtime))?;
         let database = Database::open(layout.database())?;
-        Ok(Self { layout, database })
+        Ok(Self {
+            layout,
+            database,
+            processing_queue: ProcessingQueueSignal::default(),
+            library_size_cache: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn open_with_deferred_runtime(
+        root: impl Into<PathBuf>,
+        bundled_runtime: PathBuf,
+    ) -> CoreResult<Self> {
+        let layout = AppLayout::create_with_deferred_runtime(root, bundled_runtime)?;
+        let database = Database::open(layout.database())?;
+        Ok(Self {
+            layout,
+            database,
+            processing_queue: ProcessingQueueSignal::default(),
+            library_size_cache: Mutex::new(None),
+        })
     }
 
     pub fn layout(&self) -> &AppLayout {
@@ -77,17 +123,70 @@ impl CoreService {
         &self.database
     }
 
+    pub(crate) fn processing_queue_generation(&self) -> u64 {
+        *self.processing_queue.generation.lock()
+    }
+
+    pub(crate) fn wait_for_processing_queue_change(
+        &self,
+        observed_generation: u64,
+        timeout: Duration,
+    ) -> bool {
+        let mut generation = self.processing_queue.generation.lock();
+        if *generation == observed_generation {
+            self.processing_queue
+                .changed
+                .wait_for(&mut generation, timeout);
+        }
+        *generation != observed_generation
+    }
+
+    pub(crate) fn notify_processing_queue(&self) {
+        let mut generation = self.processing_queue.generation.lock();
+        *generation = generation.wrapping_add(1);
+        self.processing_queue.changed.notify_all();
+    }
+
+    pub(crate) fn invalidate_library_size_cache(&self) {
+        self.library_size_cache.lock().take();
+    }
+
     pub fn schema_version(&self) -> u32 {
         SCHEMA_VERSION
     }
 
     pub fn recover_interrupted_work(&self) -> CoreResult<()> {
-        self.repair_recording_partials()?;
-        let recovered = crate::recording::recover_interrupted_recordings(self)?;
-        if recovered > 0 {
-            log::warn!("recovered {recovered} interrupted recording session(s)");
-        }
-        self.remove_abandoned_import_partials()?;
+        let recovery_scope = self.capture_startup_recovery_scope()?;
+        self.recover_interrupted_processing_jobs()?;
+        self.recover_recordings_and_cleanup(recovery_scope)
+    }
+
+    /// Snapshots crash-recovery ownership before the app becomes interactive.
+    /// Background recovery may only mutate these sessions/meetings, preventing
+    /// a newly started recording from being mistaken for stale work.
+    pub(crate) fn capture_startup_recovery_scope(&self) -> CoreResult<StartupRecoveryScope> {
+        let captured_at_ms = now_ms();
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT id,meeting_id FROM recording_sessions
+             WHERE state IN ('starting','recording','paused','finalizing')",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(StartupRecoveryScope {
+            captured_at_ms,
+            recording_session_ids: rows.iter().map(|(id, _)| id.clone()).collect(),
+            recording_meeting_ids: rows.into_iter().map(|(_, id)| id).collect(),
+        })
+    }
+
+    /// Restores durable queue ownership before the coordinator starts. This is
+    /// intentionally database-only so it remains safe on the first-paint path.
+    pub(crate) fn recover_interrupted_processing_jobs(&self) -> CoreResult<()> {
+        let _span = PerformanceSpan::new("startup_queue_recovery", "scope=database");
         let connection = self.database.connect()?;
         let now = now_ms();
         connection.execute(
@@ -112,19 +211,47 @@ impl CoreService {
              WHERE status = 'interrupted'",
             [now],
         )?;
-        connection.execute(
-            "UPDATE recording_sessions
-             SET state='failed', ended_at_ms=?1,
-                 error_message=COALESCE(error_message, 'Application exited during recording')
-             WHERE state IN ('starting','recording','paused','finalizing')",
-            [now],
+        self.notify_processing_queue();
+        Ok(())
+    }
+
+    /// Performs filesystem scans, recording salvage, and stale partial cleanup
+    /// after the UI can paint. Any recovered processing job wakes the queue.
+    pub(crate) fn recover_recordings_and_cleanup(
+        &self,
+        recovery_scope: StartupRecoveryScope,
+    ) -> CoreResult<()> {
+        let _span = PerformanceSpan::new("startup_file_recovery", "scope=managed_library");
+        self.repair_recording_partials(&recovery_scope)?;
+        let recovered = crate::recording::recover_interrupted_recordings(
+            self,
+            &recovery_scope.recording_session_ids,
         )?;
-        connection.execute(
-            "UPDATE meetings
-             SET status='failed', ended_at_ms=COALESCE(ended_at_ms, ?1)
-             WHERE status='recording'",
-            [now],
-        )?;
+        if recovered > 0 {
+            log::warn!("recovered {recovered} interrupted recording session(s)");
+        }
+        self.remove_abandoned_import_partials(recovery_scope.captured_at_ms)?;
+        let connection = self.database.connect()?;
+        let now = now_ms();
+        for session_id in &recovery_scope.recording_session_ids {
+            connection.execute(
+                "UPDATE recording_sessions
+                 SET state='failed', ended_at_ms=?1,
+                     error_message=COALESCE(error_message, 'Application exited during recording')
+                 WHERE id=?2 AND state IN ('starting','recording','paused','finalizing')",
+                params![now, session_id],
+            )?;
+        }
+        for meeting_id in &recovery_scope.recording_meeting_ids {
+            connection.execute(
+                "UPDATE meetings
+                 SET status='failed', ended_at_ms=COALESCE(ended_at_ms, ?1)
+                 WHERE id=?2 AND status='recording'",
+                params![now, meeting_id],
+            )?;
+        }
+        self.invalidate_library_size_cache();
+        self.notify_processing_queue();
         Ok(())
     }
 
@@ -161,13 +288,24 @@ impl CoreService {
                     ))
                 },
             )?;
-        let storage_bytes = managed_directory_size(self.layout.library())?;
+        let storage_bytes = self.cached_library_size()?;
         Ok(LibraryStats {
             meeting_count,
             recording_count,
             processing_count,
             storage_bytes,
         })
+    }
+
+    fn cached_library_size(&self) -> CoreResult<u64> {
+        if let Some((measured_at, bytes)) = *self.library_size_cache.lock() {
+            if measured_at.elapsed() <= LIBRARY_SIZE_CACHE_TTL {
+                return Ok(bytes);
+            }
+        }
+        let bytes = managed_directory_size(self.layout.library())?;
+        *self.library_size_cache.lock() = Some((Instant::now(), bytes));
+        Ok(bytes)
     }
 
     pub fn import_media(
@@ -250,6 +388,8 @@ impl CoreService {
             let _ = fs::remove_file(&destination);
             return Err(error);
         }
+        self.invalidate_library_size_cache();
+        self.notify_processing_queue();
         Ok(ImportMediaResult {
             meeting: self.get_meeting_summary(&meeting_id)?,
             asset: self.get_asset(&asset_id)?,
@@ -313,6 +453,7 @@ impl CoreService {
     }
 
     pub fn get_meeting(&self, meeting_id: &str) -> CoreResult<MeetingDetail> {
+        let _span = PerformanceSpan::new("meeting_detail_load", "query=batched");
         let meeting = self.get_meeting_summary(meeting_id)?;
         let connection = self.database.connect()?;
 
@@ -344,13 +485,25 @@ impl CoreService {
             .query_map([meeting_id], map_turn_without_words)?
             .collect::<Result<Vec<_>, _>>()?;
         let mut word_statement = connection.prepare(
-            "SELECT id,turn_id,start_ms,end_ms,text,confidence,speaker_id,is_overlap
-             FROM words WHERE turn_id=?1 ORDER BY sequence",
+            "SELECT w.id,w.turn_id,w.start_ms,w.end_ms,w.text,w.confidence,
+                    w.speaker_id,w.is_overlap
+             FROM words w
+             JOIN transcript_turns t ON t.id=w.turn_id
+             WHERE t.meeting_id=?1
+             ORDER BY t.start_ms,t.id,w.sequence",
         )?;
+        let mut words_by_turn = BTreeMap::<String, Vec<WordTiming>>::new();
+        for word in word_statement
+            .query_map([meeting_id], map_word)?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            words_by_turn
+                .entry(word.turn_id.clone())
+                .or_default()
+                .push(word);
+        }
         for turn in &mut turns {
-            turn.words = word_statement
-                .query_map([&turn.id], map_word)?
-                .collect::<Result<Vec<_>, _>>()?;
+            turn.words = words_by_turn.remove(&turn.id).unwrap_or_default();
         }
 
         let mut marker_statement = connection.prepare(
@@ -476,6 +629,7 @@ impl CoreService {
                 log::error!("refused or failed to remove terminal job workspace {job_id}: {error}");
             }
         }
+        self.invalidate_library_size_cache();
         Ok(())
     }
 
@@ -1242,6 +1396,7 @@ impl CoreService {
                 [&job.meeting_id],
             )?;
         }
+        self.notify_processing_queue();
         Ok(job)
     }
 
@@ -1259,6 +1414,7 @@ impl CoreService {
                 "only failed or cancelled jobs can be retried".into(),
             ));
         }
+        self.notify_processing_queue();
         self.get_job(job_id)
     }
 
@@ -1285,6 +1441,7 @@ impl CoreService {
             "UPDATE meetings SET status='processing' WHERE id=?1",
             [meeting_id],
         )?;
+        self.notify_processing_queue();
         self.get_job(&id)
     }
 
@@ -1502,20 +1659,17 @@ impl CoreService {
         let worker_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("worker");
-        let packaged_runtime_ready = runtime_payload_ready(self.layout.runtime());
-        let development_runtime_ready = cfg!(debug_assertions)
-            && worker_root
-                .join(".venv")
-                .join("Scripts")
-                .join("python.exe")
-                .is_file()
-            && worker_root
-                .join("src")
-                .join("local_transcript_worker")
-                .join("__main__.py")
-                .is_file()
-            && media_tools::resolve(&self.layout, MediaTool::Ffmpeg).is_ok()
-            && media_tools::resolve(&self.layout, MediaTool::Ffprobe).is_ok();
+        let packaged_runtime_ready = self.layout.runtime_validated();
+        let development_runtime_ready =
+            cfg!(any(debug_assertions, feature = "development-runtime"))
+                && development_python(&worker_root).is_file()
+                && worker_root
+                    .join("src")
+                    .join("local_transcript_worker")
+                    .join("__main__.py")
+                    .is_file()
+                && media_tools::resolve(&self.layout, MediaTool::Ffmpeg).is_ok()
+                && media_tools::resolve(&self.layout, MediaTool::Ffprobe).is_ok();
         let runtime_ready = packaged_runtime_ready || development_runtime_ready;
         let manifest = bundled_model_manifest();
         let model_ready = |key: &str| {
@@ -1533,15 +1687,32 @@ impl CoreService {
                 .unwrap_or(false)
         };
         let live_ready = model_ready("live_asr_en");
-        let final_ready = model_ready("final_asr_en") && model_ready("alignment_en");
+        let final_ready = model_ready("final_asr_en")
+            && (cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                || model_ready("alignment_en"));
         let diarization_ready = model_ready("diarization") && model_ready("speaker_embedding");
+        let runtime_status = if runtime_ready {
+            "ready"
+        } else if self.layout.runtime_validation_pending() {
+            "checking"
+        } else {
+            "missing"
+        };
         ModelPackStatus {
-            runtime: ready_or_missing(runtime_ready),
+            runtime: runtime_status.into(),
             live_model: ready_or_missing(live_ready),
             final_model: ready_or_missing(final_ready),
             diarization_model: ready_or_missing(diarization_ready),
-            device: "Automatic (NVIDIA CUDA when available; CPU fallback)".into(),
-            disk_required_gb: 13.5,
+            device: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                "Apple MLX (Metal) with PyTorch MPS/CPU speaker processing".into()
+            } else {
+                "Automatic (NVIDIA CUDA when available; CPU fallback)".into()
+            },
+            disk_required_gb: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                2.0
+            } else {
+                13.5
+            },
             disk_available_gb: available_disk_gb(self.layout.root()).unwrap_or(0.0),
         }
     }
@@ -1604,8 +1775,19 @@ impl CoreService {
         Ok(turn)
     }
 
-    fn repair_recording_partials(&self) -> CoreResult<()> {
+    fn repair_recording_partials(&self, recovery_scope: &StartupRecoveryScope) -> CoreResult<()> {
         for path in files_with_suffix(self.layout.recordings(), ".wav.partial")? {
+            let belongs_to_startup_session = path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|value| recovery_scope.recording_session_ids.contains(value))
+            });
+            if !belongs_to_startup_session
+                || !file_modified_before(&path, recovery_scope.captured_at_ms)
+            {
+                continue;
+            }
             match repair_wav_header(&path) {
                 Ok(()) => {
                     let final_path = PathBuf::from(
@@ -1623,8 +1805,11 @@ impl CoreService {
         Ok(())
     }
 
-    fn remove_abandoned_import_partials(&self) -> CoreResult<()> {
+    fn remove_abandoned_import_partials(&self, captured_at_ms: i64) -> CoreResult<()> {
         for path in files_with_suffix(self.layout.media(), ".partial")? {
+            if !file_modified_before(&path, captured_at_ms) {
+                continue;
+            }
             if let Err(error) = fs::remove_file(&path) {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     log::warn!("could not remove abandoned import {:?}: {error}", path);
@@ -2091,6 +2276,14 @@ fn bundled_model_manifest() -> Option<BundledModelManifest> {
     serde_json::from_str(MODEL_MANIFEST_JSON).ok()
 }
 
+fn development_python(worker_root: &Path) -> PathBuf {
+    if cfg!(windows) {
+        worker_root.join(".venv").join("Scripts").join("python.exe")
+    } else {
+        worker_root.join(".venv").join("bin").join("python")
+    }
+}
+
 fn files_with_suffix(root: &Path, suffix: &str) -> CoreResult<Vec<PathBuf>> {
     fn visit(directory: &Path, suffix: &str, output: &mut Vec<PathBuf>) -> CoreResult<()> {
         if !directory.exists() {
@@ -2110,6 +2303,17 @@ fn files_with_suffix(root: &Path, suffix: &str) -> CoreResult<Vec<PathBuf>> {
     let mut output = Vec::new();
     visit(root, suffix, &mut output)?;
     Ok(output)
+}
+
+fn file_modified_before(path: &Path, captured_at_ms: i64) -> bool {
+    let Ok(cutoff_ms) = u128::try_from(captured_at_ms) else {
+        return false;
+    };
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .is_some_and(|age| age.as_millis() < cutoff_ms)
 }
 
 fn repair_wav_header(path: &Path) -> CoreResult<()> {
@@ -2157,14 +2361,26 @@ fn available_disk_gb(path: &Path) -> Option<f32> {
     (result != 0).then_some(available as f32 / 1024.0 / 1024.0 / 1024.0)
 }
 
-#[cfg(not(windows))]
-fn available_disk_gb(_path: &Path) -> Option<f32> {
-    None
+#[cfg(unix)]
+fn available_disk_gb(path: &Path) -> Option<f32> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let canonical = path.canonicalize().ok()?;
+    let raw = CString::new(canonical.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(raw.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_bavail as f64 * stats.f_frsize as f64 / 1024.0 / 1024.0 / 1024.0) as f32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc};
 
     fn service() -> (tempfile::TempDir, CoreService) {
         let temp = tempfile::tempdir().unwrap();
@@ -2271,6 +2487,156 @@ mod tests {
 
         assert_eq!(stats.storage_bytes, 48);
         assert_ne!(stats.storage_bytes, 999);
+    }
+
+    #[test]
+    fn library_size_cache_is_reused_and_explicitly_invalidated() {
+        let (_temp, service) = service();
+        fs::write(service.layout.media().join("first.bin"), vec![0_u8; 5]).unwrap();
+        assert_eq!(service.library_stats().unwrap().storage_bytes, 5);
+
+        fs::write(service.layout.media().join("second.bin"), vec![0_u8; 7]).unwrap();
+        assert_eq!(service.library_stats().unwrap().storage_bytes, 5);
+
+        service.invalidate_library_size_cache();
+        assert_eq!(service.library_stats().unwrap().storage_bytes, 12);
+    }
+
+    #[test]
+    fn processing_queue_notification_wakes_an_idle_waiter() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = Arc::new(CoreService::open(temp.path()).unwrap());
+        let observed = service.processing_queue_generation();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let waiting_service = service.clone();
+        let waiter = std::thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            waiting_service.wait_for_processing_queue_change(observed, Duration::from_secs(2))
+        });
+        ready_receiver.recv().unwrap();
+
+        service.notify_processing_queue();
+
+        assert!(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn background_recovery_never_touches_work_created_after_startup_snapshot() {
+        let (_temp, service) = service();
+        let recovery_scope = service.capture_startup_recovery_scope().unwrap();
+        let meeting_id = new_id();
+        let session_id = new_id();
+        let now = now_ms();
+        let recording_partial = service
+            .layout
+            .recordings()
+            .join(&meeting_id)
+            .join(&session_id)
+            .join("segment.wav.partial");
+        fs::create_dir_all(recording_partial.parent().unwrap()).unwrap();
+        fs::write(&recording_partial, b"active recording bytes").unwrap();
+        let import_partial = service.layout.media().join("active-import.partial");
+        fs::write(&import_partial, b"active import bytes").unwrap();
+        let connection = service.database.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO meetings(
+                    id,title,source_kind,status,created_at_ms,started_at_ms
+                 ) VALUES (?1,'New recording','recording','recording',?2,?2)",
+                params![meeting_id, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO recording_sessions(
+                    id,meeting_id,state,config_json,manifest_relative_path,started_at_ms
+                 ) VALUES (?1,?2,'recording','{}','manifest.jsonl',?3)",
+                params![session_id, meeting_id, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        service
+            .recover_recordings_and_cleanup(recovery_scope)
+            .unwrap();
+
+        let connection = service.database.connect().unwrap();
+        let session_state: String = connection
+            .query_row(
+                "SELECT state FROM recording_sessions WHERE id=?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let meeting_status: String = connection
+            .query_row(
+                "SELECT status FROM meetings WHERE id=?1",
+                [&meeting_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_state, "recording");
+        assert_eq!(meeting_status, "recording");
+        assert!(recording_partial.is_file());
+        assert!(import_partial.is_file());
+    }
+
+    #[test]
+    fn meeting_detail_batches_words_and_preserves_per_turn_sequence() {
+        let (_temp, service) = service();
+        let meeting_id = new_id();
+        let first_turn = new_id();
+        let second_turn = new_id();
+        let now = now_ms();
+        let connection = service.database.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO meetings(id,title,source_kind,status,created_at_ms)
+                 VALUES (?1,'Batched words','import','ready',?2)",
+                params![meeting_id, now],
+            )
+            .unwrap();
+        for (turn_id, start_ms, text) in [
+            (&first_turn, 0_i64, "hello world"),
+            (&second_turn, 1_000_i64, "goodbye"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO transcript_turns(
+                        id,meeting_id,start_ms,end_ms,model_text,created_at_ms,updated_at_ms
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?6)",
+                    params![turn_id, meeting_id, start_ms, start_ms + 900, text, now],
+                )
+                .unwrap();
+        }
+        for (turn_id, sequence, text, start_ms) in [
+            (&first_turn, 1_i64, "world", 400_i64),
+            (&first_turn, 0_i64, "hello", 0_i64),
+            (&second_turn, 0_i64, "goodbye", 1_000_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO words(
+                        id,turn_id,sequence,start_ms,end_ms,text,confidence,is_overlap
+                     ) VALUES (?1,?2,?3,?4,?5,?6,0.9,0)",
+                    params![new_id(), turn_id, sequence, start_ms, start_ms + 300, text],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let detail = service.get_meeting(&meeting_id).unwrap();
+
+        assert_eq!(detail.turns.len(), 2);
+        assert_eq!(
+            detail.turns[0]
+                .words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hello", "world"]
+        );
+        assert_eq!(detail.turns[1].words[0].text, "goodbye");
     }
 
     #[test]

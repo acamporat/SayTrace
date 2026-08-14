@@ -7,6 +7,7 @@ use zeroize::Zeroize;
 use crate::{
     error::{ApiError, CommandResult, CoreError},
     models::*,
+    performance::PerformanceSpan,
     AppState,
 };
 
@@ -37,12 +38,27 @@ pub fn get_app_status(state: State<'_, AppState>) -> CommandResult<AppStatus> {
         worker,
         model_revisions: state.core.model_revisions(),
         capabilities: [
-            ("platform".into(), serde_json::json!("windows")),
+            (
+                "platform".into(),
+                serde_json::json!(if cfg!(target_os = "macos") {
+                    "macos"
+                } else {
+                    "windows"
+                }),
+            ),
             ("language".into(), serde_json::json!("en")),
             ("wasapiLoopback".into(), serde_json::json!(cfg!(windows))),
             (
+                "screenCaptureKitAudio".into(),
+                serde_json::json!(cfg!(target_os = "macos")),
+            ),
+            (
                 "voiceProfilesDpapi".into(),
                 serde_json::json!(cfg!(windows)),
+            ),
+            (
+                "voiceProfilesKeychain".into(),
+                serde_json::json!(cfg!(target_os = "macos")),
             ),
         ]
         .into_iter()
@@ -56,7 +72,10 @@ pub fn get_library_stats(state: State<'_, AppState>) -> CommandResult<LibrarySta
 }
 
 #[tauri::command]
-pub fn import_media(app: AppHandle, state: State<'_, AppState>) -> CommandResult<Option<Meeting>> {
+pub async fn import_media(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CommandResult<Option<Meeting>> {
     let selected = app
         .dialog()
         .file()
@@ -74,10 +93,14 @@ pub fn import_media(app: AppHandle, state: State<'_, AppState>) -> CommandResult
     let path = selected
         .into_path()
         .map_err(|error| ApiError::new("invalid_file_selection", error.to_string()))?;
-    let result = state
-        .core
-        .import_media(&path, None)
-        .map_err(ApiError::from)?;
+    let core = state.core.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _span = PerformanceSpan::new("media_import", "source=user_selected");
+        core.import_media(&path, None)
+    })
+    .await
+    .map_err(|error| blocking_task_error("media import", error))?
+    .map_err(ApiError::from)?;
     Ok(Some(result.meeting))
 }
 
@@ -437,19 +460,33 @@ pub fn export_transcript(
 }
 
 #[tauri::command]
-pub fn backup_library(
+pub async fn backup_library(
     request: BackupRequest,
     state: State<'_, AppState>,
 ) -> CommandResult<BackupResult> {
-    state
-        .core
-        .backup_library(request.include_media)
-        .map_err(ApiError::from)
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _span = PerformanceSpan::new(
+            "library_backup",
+            format!("include_media={}", request.include_media),
+        );
+        core.backup_library(request.include_media)
+    })
+    .await
+    .map_err(|error| blocking_task_error("library backup", error))?
+    .map_err(ApiError::from)
 }
 
 #[tauri::command]
-pub fn create_backup(state: State<'_, AppState>) -> CommandResult<BackupResult> {
-    state.core.backup_library(true).map_err(ApiError::from)
+pub async fn create_backup(state: State<'_, AppState>) -> CommandResult<BackupResult> {
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _span = PerformanceSpan::new("library_backup", "include_media=true");
+        core.backup_library(true)
+    })
+    .await
+    .map_err(|error| blocking_task_error("library backup", error))?
+    .map_err(ApiError::from)
 }
 
 #[tauri::command]
@@ -562,14 +599,21 @@ pub fn add_marker(
 }
 
 #[tauri::command]
-pub fn stop_recording(
+pub async fn stop_recording(
     session_id: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> CommandResult<Meeting> {
-    state
-        .recording
-        .stop(&session_id, app)
+    let recording = state.recording.clone();
+    tauri::async_runtime::spawn_blocking(move || recording.stop(&session_id, app))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                "recording_finalization_failed",
+                format!("recording finalization task failed: {error}"),
+            )
+            .retryable()
+        })?
         .map_err(ApiError::from)
 }
 
@@ -589,33 +633,46 @@ pub fn get_model_status(state: State<'_, AppState>) -> ModelPackStatus {
 }
 
 #[tauri::command]
-pub fn install_model_pack(
+pub async fn install_model_pack(
     mut hugging_face_token: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> CommandResult<ModelPackStatus> {
-    let result = state
-        .worker
-        .install_model_pack(&hugging_face_token, |progress| {
+    let worker = state.worker.clone();
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _span = PerformanceSpan::new("model_pack_install", "source=pinned_manifest");
+        let result = worker.install_model_pack(&hugging_face_token, |progress| {
             if let Err(error) = app.emit("model://setup-progress", progress) {
                 log::warn!("could not emit model setup progress: {error}");
             }
         });
-    hugging_face_token.zeroize();
-    result.map_err(ApiError::from)?;
-    let status = state.core.model_status();
-    if status.runtime != "ready"
-        || status.live_model != "ready"
-        || status.final_model != "ready"
-        || status.diarization_model != "ready"
-    {
-        return Err(ApiError::new(
-            "model_setup_incomplete",
-            "one or more pinned model files are missing or failed verification",
-        ));
-    }
-    state.core.mark_setup_complete().map_err(ApiError::from)?;
-    Ok(status)
+        hugging_face_token.zeroize();
+        result.map_err(ApiError::from)?;
+        let status = core.model_status();
+        if status.runtime != "ready"
+            || status.live_model != "ready"
+            || status.final_model != "ready"
+            || status.diarization_model != "ready"
+        {
+            return Err(ApiError::new(
+                "model_setup_incomplete",
+                "one or more pinned model files are missing or failed verification",
+            ));
+        }
+        core.mark_setup_complete().map_err(ApiError::from)?;
+        Ok(status)
+    })
+    .await
+    .map_err(|error| blocking_task_error("model installation", error))?
+}
+
+fn blocking_task_error(operation: &str, error: impl std::fmt::Display) -> ApiError {
+    ApiError::new(
+        "background_task_failed",
+        format!("{operation} task failed: {error}"),
+    )
+    .retryable()
 }
 
 fn ensure_speaker_in_meeting(

@@ -548,9 +548,9 @@ fn response_instructions(question: &str) -> &'static str {
             "Answer the question directly, then organize the explanation into no more than five themed sections. ",
             "Within each section, use the item title for the key takeaway and detail for concrete support."
         ),
-        AnswerMode::General => concat!(
+        AnswerMode::General => {
             "Answer directly. Add sections only when the answer has multiple distinct themes."
-        ),
+        }
     }
 }
 

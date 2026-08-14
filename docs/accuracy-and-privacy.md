@@ -48,8 +48,8 @@ gate until it is exercised against the full pinned runtime and models.
 
 ## Network boundary
 
-A production release includes an Authenticode-signed processing runtime in the
-normal SayTrace installer. Explicit first-run model setup may then
+A production release includes a platform-signed processing runtime in the normal
+SayTrace installer or app bundle. Explicit first-run model setup may then
 download revision-pinned, SHA-256-verified model files once the user accepts the
 Community-1 terms. After setup:
 

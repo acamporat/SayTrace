@@ -8,9 +8,12 @@ import math
 import os
 import struct
 import threading
+import time
 import uuid
 import wave
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -143,6 +146,7 @@ class FinalPipeline:
         embedder: Embedder | None,
         emit: EventCallback,
         correlation_factory: CorrelationFactory | None = None,
+        release_backends_after_stage: bool = False,
     ) -> None:
         self.normalizer = normalizer
         self.transcriber = transcriber
@@ -151,43 +155,53 @@ class FinalPipeline:
         self.embedder = embedder
         self.emit = emit
         self.correlation_factory = correlation_factory or NumpyWaveCorrelation
+        self.release_backends_after_stage = release_backends_after_stage
 
     def run(self, request: PipelineInput, cancel: threading.Event) -> JsonObject:
         store = ArtifactStore(request.workspace)
         checkpoint = request.checkpoint
         warnings: list[JsonObject] = []
 
-        normalized = self._normalize(request, checkpoint, store, cancel)
+        with self._stage_timing(request, "normalize"):
+            normalized = self._normalize(request, checkpoint, store, cancel)
         try:
-            transcribed = self._transcribe(request, normalized, checkpoint, store, cancel)
+            with self._stage_timing(request, "transcribe"):
+                transcribed = self._transcribe(request, normalized, checkpoint, store, cancel)
         finally:
-            release_backend(self.transcriber)
+            self._release_stage_backend(self.transcriber)
         try:
-            aligned = self._align(
-                request, normalized, transcribed, checkpoint, store, cancel, warnings
+            with self._stage_timing(request, "align"):
+                aligned = self._align(
+                    request, normalized, transcribed, checkpoint, store, cancel, warnings
+                )
+        finally:
+            self._release_stage_backend(self.aligner)
+        try:
+            with self._stage_timing(request, "diarize"):
+                diarization = self._diarize(request, normalized, checkpoint, store, cancel)
+        finally:
+            self._release_stage_backend(self.diarizer)
+        with self._stage_timing(request, "merge"):
+            merged = self._merge(
+                request, normalized, aligned, diarization, checkpoint, store, cancel
             )
-        finally:
-            release_backend(self.aligner)
         try:
-            diarization = self._diarize(request, normalized, checkpoint, store, cancel)
+            with self._stage_timing(request, "identify"):
+                matches, speaker_candidates = self._identify(
+                    request,
+                    normalized,
+                    diarization,
+                    checkpoint,
+                    store,
+                    cancel,
+                    warnings,
+                )
         finally:
-            release_backend(self.diarizer)
-        merged = self._merge(request, normalized, aligned, diarization, checkpoint, store, cancel)
-        try:
-            matches, speaker_candidates = self._identify(
-                request,
-                normalized,
-                diarization,
-                checkpoint,
-                store,
-                cancel,
-                warnings,
+            self._release_stage_backend(self.embedder)
+        with self._stage_timing(request, "index_finalize"):
+            final_artifact, turns = self._index_and_finalize(
+                request, merged, matches, checkpoint, store, warnings
             )
-        finally:
-            release_backend(self.embedder)
-        final_artifact, turns = self._index_and_finalize(
-            request, merged, matches, checkpoint, store, warnings
-        )
         self._progress(
             request,
             "finalize",
@@ -212,6 +226,32 @@ class FinalPipeline:
             result["playback_artifact_path"] = str(playback_artifact)
         return result
 
+    def _release_stage_backend(self, backend: object | None) -> None:
+        if self.release_backends_after_stage:
+            release_backend(backend)
+
+    @contextmanager
+    def _stage_timing(self, request: PipelineInput, stage: str) -> Iterator[None]:
+        started = time.monotonic()
+        status = "complete"
+        try:
+            yield
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            self.emit(
+                "performance_timing",
+                {
+                    "scope": "pipeline_stage",
+                    "job_id": request.job_id,
+                    "pipeline_version": request.pipeline_version,
+                    "stage": stage,
+                    "status": status,
+                    "duration_ms": max(0, round((time.monotonic() - started) * 1000)),
+                },
+            )
+
     def _normalize(
         self,
         request: PipelineInput,
@@ -221,22 +261,42 @@ class FinalPipeline:
     ) -> dict[str, Path]:
         result: dict[str, Path] = {}
         total = len(request.sources)
-        for index, source in enumerate(request.sources, 1):
-            batch = f"normalize:{source.asset_id}"
-            resumed = self._resume(checkpoint, store, batch)
+        resumed_paths: dict[str, Path] = {}
+        pending: dict[str, Future[Path]] = {}
+        missing: list[SourceAsset] = []
+        for source in request.sources:
+            resumed = self._resume(checkpoint, store, f"normalize:{source.asset_id}")
             if resumed:
-                path = _workspace_file(request.workspace, str(resumed["normalized_path"]))
-            else:
-                path = request.workspace / "normalized" / f"{source.asset_id}.wav"
-                self.normalizer.normalize(source.path, path, cancel)
-                artifact = store.write(
-                    "normalize",
-                    batch,
-                    {"asset_id": source.asset_id, "normalized_path": str(path)},
+                resumed_paths[source.asset_id] = _workspace_file(
+                    request.workspace, str(resumed["normalized_path"])
                 )
-                self._complete(checkpoint, batch, artifact)
-            result[source.asset_id] = path
-            self._progress(request, "normalize", "running", index, total, checkpoint)
+            else:
+                missing.append(source)
+
+        # FFmpeg processes are independent. Submit them together, then publish
+        # artifacts and progress in source order so resume state and errors stay
+        # deterministic regardless of completion order.
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(2, len(missing))), thread_name_prefix="normalize"
+        ) as executor:
+            for source in missing:
+                target = request.workspace / "normalized" / f"{source.asset_id}.wav"
+                pending[source.asset_id] = executor.submit(
+                    self.normalizer.normalize, source.path, target, cancel
+                )
+            for index, source in enumerate(request.sources, 1):
+                batch = f"normalize:{source.asset_id}"
+                path = resumed_paths.get(source.asset_id)
+                if path is None:
+                    path = pending[source.asset_id].result()
+                    artifact = store.write(
+                        "normalize",
+                        batch,
+                        {"asset_id": source.asset_id, "normalized_path": str(path)},
+                    )
+                    self._complete(checkpoint, batch, artifact)
+                result[source.asset_id] = path
+                self._progress(request, "normalize", "running", index, total, checkpoint)
         return result
 
     def _transcribe(

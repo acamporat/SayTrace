@@ -1,5 +1,5 @@
 import { Bookmark, MessageSquare, MoreVertical } from "lucide-react";
-import { useState } from "react";
+import { memo, useCallback, useMemo, useRef, useState } from "react";
 import { formatDuration } from "../lib/format";
 import type { MeetingSpeaker, TranscriptTurn } from "../types";
 import { SpeakerAvatar } from "./SpeakerAvatar";
@@ -12,12 +12,16 @@ interface TranscriptRowsProps {
   selectedTurnId?: string;
   activeTurnId?: string;
   activeWordId?: string;
+  playedWordId?: string;
+  /** Retained for callers that provide a discrete position instead of a word cursor. */
   playbackPositionMs?: number;
   onSelectTurn?: (turnId: string) => void;
   onEdit?: (turnId: string, editedText: string) => void;
   onToggleMarker?: (turnId: string) => void;
   onToggleReview?: (turnId: string) => void;
 }
+
+type PlaybackState = "past" | "active" | "future" | "none";
 
 function HighlightedText({ text, query }: { text: string; query?: string }) {
   if (!query?.trim()) return text;
@@ -88,40 +92,26 @@ function findWordRange(text: string, token: string, cursor: number) {
   return undefined;
 }
 
-function TimedTranscriptText({
-  text,
-  query,
-  words,
-  activeWordId,
-  playbackPositionMs,
-}: {
+type TimedPart = {
+  key: string;
   text: string;
-  query?: string;
-  words: TranscriptTurn["words"];
-  activeWordId?: string;
-  playbackPositionMs?: number;
-}) {
-  if (!words?.length) return <HighlightedText text={text} query={query} />;
+  start: number;
+  word?: NonNullable<TranscriptTurn["words"]>[number];
+  wordIndex?: number;
+};
 
-  const lowerText = text.toLocaleLowerCase();
-  const parts: Array<{
-    key: string;
-    text: string;
-    start: number;
-    word?: NonNullable<TranscriptTurn["words"]>[number];
-  }> = [];
-  const term = query?.trim() ?? "";
-  const highlightStart = term
-    ? lowerText.indexOf(term.toLocaleLowerCase())
-    : -1;
-  const highlightEnd = highlightStart < 0 ? -1 : highlightStart + term.length;
+function alignTimedParts(
+  text: string,
+  words: NonNullable<TranscriptTurn["words"]>,
+): TimedPart[] {
+  const parts: TimedPart[] = [];
   let cursor = 0;
 
-  for (const word of words) {
+  words.forEach((word, wordIndex) => {
     const token = word.text.trim();
-    if (!token) continue;
+    if (!token) return;
     const range = findWordRange(text, token, cursor);
-    if (!range) continue;
+    if (!range) return;
     const { start, end } = range;
     if (start > cursor) {
       parts.push({
@@ -130,13 +120,56 @@ function TimedTranscriptText({
         start: cursor,
       });
     }
-    parts.push({ key: word.id, text: text.slice(start, end), start, word });
+    parts.push({
+      key: word.id,
+      text: text.slice(start, end),
+      start,
+      word,
+      wordIndex,
+    });
     cursor = end;
-  }
+  });
 
   if (cursor < text.length) {
     parts.push({ key: "tail", text: text.slice(cursor), start: cursor });
   }
+  return parts;
+}
+
+const TimedTranscriptText = memo(function TimedTranscriptText({
+  text,
+  query,
+  words,
+  activeWordId,
+  playedWordId,
+  playbackState,
+  playbackPositionMs,
+}: {
+  text: string;
+  query?: string;
+  words: TranscriptTurn["words"];
+  activeWordId?: string;
+  playedWordId?: string;
+  playbackState: PlaybackState;
+  playbackPositionMs?: number;
+}) {
+  const parts = useMemo(
+    () => (words?.length ? alignTimedParts(text, words) : undefined),
+    [text, words],
+  );
+  const playedWordIndex = useMemo(
+    () => words?.findIndex((word) => word.id === playedWordId) ?? -1,
+    [playedWordId, words],
+  );
+
+  if (!parts) return <HighlightedText text={text} query={query} />;
+
+  const lowerText = text.toLocaleLowerCase();
+  const term = query?.trim() ?? "";
+  const highlightStart = term
+    ? lowerText.indexOf(term.toLocaleLowerCase())
+    : -1;
+  const highlightEnd = highlightStart < 0 ? -1 : highlightStart + term.length;
 
   return (
     <>
@@ -154,8 +187,12 @@ function TimedTranscriptText({
         }
         const isCurrent = part.word.id === activeWordId;
         const isPlayed =
-          playbackPositionMs !== undefined &&
-          part.word.endMs <= playbackPositionMs;
+          playbackPositionMs !== undefined
+            ? part.word.endMs <= playbackPositionMs
+            : playbackState === "past" ||
+              (playbackState === "active" &&
+                playedWordIndex >= 0 &&
+                (part.wordIndex ?? -1) <= playedWordIndex);
         return (
           <span
             key={part.key}
@@ -176,7 +213,171 @@ function TimedTranscriptText({
       })}
     </>
   );
+});
+
+interface TranscriptRowProps {
+  turn: TranscriptTurn;
+  speaker?: MeetingSpeaker;
+  search?: string;
+  editable: boolean;
+  selected: boolean;
+  playbackState: PlaybackState;
+  activeWordId?: string;
+  playedWordId?: string;
+  playbackPositionMs?: number;
+  isLastDraft: boolean;
+  menuOpen: boolean;
+  onSelectTurn: (turnId: string) => void;
+  onEdit: (turnId: string, editedText: string) => void;
+  onToggleMarker: (turnId: string) => void;
+  onToggleReview: (turnId: string) => void;
+  onToggleMenu: (turnId: string) => void;
 }
+
+const TranscriptRow = memo(function TranscriptRow({
+  turn,
+  speaker: suppliedSpeaker,
+  search,
+  editable,
+  selected,
+  playbackState,
+  activeWordId,
+  playedWordId,
+  playbackPositionMs,
+  isLastDraft,
+  menuOpen,
+  onSelectTurn,
+  onEdit,
+  onToggleMarker,
+  onToggleReview,
+  onToggleMenu,
+}: TranscriptRowProps) {
+  const speaker = suppliedSpeaker ?? {
+    id: turn.speakerId ?? "unknown",
+    displayName:
+      turn.speakerId === "you"
+        ? "You"
+        : turn.speakerId
+          ? `Speaker ${turn.speakerId.replace(/\D/g, "") || ""}`.trim()
+          : "Speaker 1",
+    initials: turn.speakerId === "you" ? "Y" : "U",
+    color: turn.speakerId === "you" ? "#0868df" : "#676c72",
+    state: "Unknown" as const,
+  };
+  const displayText = turn.editedText ?? turn.modelText;
+  const alignedWords =
+    turn.editedText == null || turn.editedText === turn.modelText
+      ? turn.words
+      : undefined;
+  const active = playbackState === "active";
+
+  return (
+    <article
+      className={`transcript-row ${selected ? "is-selected" : ""} ${
+        active ? "is-playback-active" : ""
+      } ${turn.needsReview ? "needs-review" : ""}`}
+      data-playback-active={active ? "true" : undefined}
+      data-turn-id={turn.id}
+      onClick={() => onSelectTurn(turn.id)}
+    >
+      <time>{formatDuration(turn.startMs)}</time>
+      <SpeakerAvatar initials={speaker.initials} color={speaker.color} />
+      <div className="transcript-row__content">
+        <strong>{speaker.displayName}</strong>
+        {editable ? (
+          <div
+            className="transcript-row__editor"
+            contentEditable
+            suppressContentEditableWarning
+            role="textbox"
+            aria-label={`${speaker.displayName} transcript at ${formatDuration(
+              turn.startMs,
+            )}`}
+            onBlur={(event) => {
+              const editedText = event.currentTarget.textContent ?? "";
+              if (editedText !== displayText) onEdit(turn.id, editedText);
+            }}
+          >
+            <TimedTranscriptText
+              text={displayText}
+              query={search}
+              words={alignedWords}
+              activeWordId={activeWordId}
+              playedWordId={playedWordId}
+              playbackState={playbackState}
+              playbackPositionMs={playbackPositionMs}
+            />
+          </div>
+        ) : (
+          <p>
+            <TimedTranscriptText
+              text={displayText}
+              query={search}
+              words={alignedWords}
+              activeWordId={activeWordId}
+              playedWordId={playedWordId}
+              playbackState={playbackState}
+              playbackPositionMs={playbackPositionMs}
+            />
+            {turn.isDraft && isLastDraft ? (
+              <span className="draft-ellipsis" aria-label="Caption updating">
+                <i />
+                <i />
+                <i />
+              </span>
+            ) : null}
+          </p>
+        )}
+      </div>
+      {editable ? (
+        <div className="transcript-row__actions">
+          <button
+            className={turn.isMarked ? "is-active" : ""}
+            type="button"
+            aria-label={turn.isMarked ? "Remove bookmark" : "Add bookmark"}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleMarker(turn.id);
+            }}
+          >
+            <Bookmark size={18} fill={turn.isMarked ? "currentColor" : "none"} />
+          </button>
+          <button
+            className={turn.needsReview ? "is-active" : ""}
+            type="button"
+            aria-label="More transcript actions"
+            aria-expanded={menuOpen}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleMenu(turn.id);
+            }}
+          >
+            {turn.needsReview ? (
+              <MessageSquare size={17} fill="currentColor" />
+            ) : (
+              <MoreVertical size={18} />
+            )}
+          </button>
+          {menuOpen ? (
+            <div className="transcript-row__menu">
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggleReview(turn.id);
+                  onToggleMenu(turn.id);
+                }}
+              >
+                <MessageSquare size={15} />
+                {turn.needsReview ? "Clear review flag" : "Flag for review"}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </article>
+  );
+});
 
 export function TranscriptRows({
   turns,
@@ -186,6 +387,7 @@ export function TranscriptRows({
   selectedTurnId,
   activeTurnId,
   activeWordId,
+  playedWordId,
   playbackPositionMs,
   onSelectTurn,
   onEdit,
@@ -193,145 +395,78 @@ export function TranscriptRows({
   onToggleReview,
 }: TranscriptRowsProps) {
   const [openTurnMenu, setOpenTurnMenu] = useState<string>();
+  const callbacksRef = useRef({
+    onSelectTurn,
+    onEdit,
+    onToggleMarker,
+    onToggleReview,
+  });
+  callbacksRef.current = {
+    onSelectTurn,
+    onEdit,
+    onToggleMarker,
+    onToggleReview,
+  };
+  const speakerById = useMemo(
+    () => new Map(speakers.map((speaker) => [speaker.id, speaker])),
+    [speakers],
+  );
+  const activeTurnIndex = useMemo(
+    () => turns.findIndex((turn) => turn.id === activeTurnId),
+    [activeTurnId, turns],
+  );
+
+  const selectTurn = useCallback((turnId: string) => {
+    callbacksRef.current.onSelectTurn?.(turnId);
+  }, []);
+  const editTurn = useCallback((turnId: string, editedText: string) => {
+    callbacksRef.current.onEdit?.(turnId, editedText);
+  }, []);
+  const toggleMarker = useCallback((turnId: string) => {
+    callbacksRef.current.onToggleMarker?.(turnId);
+  }, []);
+  const toggleReview = useCallback((turnId: string) => {
+    callbacksRef.current.onToggleReview?.(turnId);
+  }, []);
+  const toggleMenu = useCallback((turnId: string) => {
+    setOpenTurnMenu((current) => (current === turnId ? undefined : turnId));
+  }, []);
+  const lastTurnId = turns[turns.length - 1]?.id;
 
   return (
     <div className="transcript-rows">
-      {turns.map((turn) => {
-        const speaker =
-          speakers.find((candidate) => candidate.id === turn.speakerId) ??
-          speakers[0] ?? {
-            id: turn.speakerId ?? "unknown",
-            displayName:
-              turn.speakerId === "you"
-                ? "You"
-                : turn.speakerId
-                  ? `Speaker ${turn.speakerId.replace(/\D/g, "") || ""}`.trim()
-                  : "Speaker 1",
-            initials: turn.speakerId === "you" ? "Y" : "U",
-            color: turn.speakerId === "you" ? "#0868df" : "#676c72",
-            state: "Unknown" as const,
-          };
-        const displayText = turn.editedText ?? turn.modelText;
-        const alignedWords =
-          turn.editedText == null || turn.editedText === turn.modelText
-            ? turn.words
-            : undefined;
+      {turns.map((turn, index) => {
+        const playbackState: PlaybackState =
+          activeTurnIndex < 0
+            ? "none"
+            : index < activeTurnIndex
+              ? "past"
+              : index === activeTurnIndex
+                ? "active"
+                : "future";
+        const active = playbackState === "active";
         return (
-          <article
+          <TranscriptRow
             key={turn.id}
-            className={`transcript-row ${
-              selectedTurnId === turn.id ? "is-selected" : ""
-            } ${activeTurnId === turn.id ? "is-playback-active" : ""} ${
-              turn.needsReview ? "needs-review" : ""
-            }`}
-            data-playback-active={activeTurnId === turn.id ? "true" : undefined}
-            data-turn-id={turn.id}
-            onClick={() => onSelectTurn?.(turn.id)}
-          >
-            <time>{formatDuration(turn.startMs)}</time>
-            <SpeakerAvatar initials={speaker.initials} color={speaker.color} />
-            <div className="transcript-row__content">
-              <strong>{speaker.displayName}</strong>
-              {editable ? (
-                <div
-                  className="transcript-row__editor"
-                  contentEditable
-                  suppressContentEditableWarning
-                  role="textbox"
-                  aria-label={`${speaker.displayName} transcript at ${formatDuration(
-                    turn.startMs,
-                  )}`}
-                  onBlur={(event) => {
-                    const editedText = event.currentTarget.textContent ?? "";
-                    if (editedText !== displayText) {
-                      onEdit?.(turn.id, editedText);
-                    }
-                  }}
-                >
-                  <TimedTranscriptText
-                    text={displayText}
-                    query={search}
-                    words={alignedWords}
-                    activeWordId={activeWordId}
-                    playbackPositionMs={playbackPositionMs}
-                  />
-                </div>
-              ) : (
-                <p>
-                  <TimedTranscriptText
-                    text={displayText}
-                    query={search}
-                    words={alignedWords}
-                    activeWordId={activeWordId}
-                    playbackPositionMs={playbackPositionMs}
-                  />
-                  {turn.isDraft &&
-                  turn.id === turns[turns.length - 1]?.id ? (
-                    <span className="draft-ellipsis" aria-label="Caption updating">
-                      <i />
-                      <i />
-                      <i />
-                    </span>
-                  ) : null}
-                </p>
-              )}
-            </div>
-            {editable ? (
-              <div className="transcript-row__actions">
-                <button
-                  className={turn.isMarked ? "is-active" : ""}
-                  type="button"
-                  aria-label={
-                    turn.isMarked ? "Remove bookmark" : "Add bookmark"
-                  }
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onToggleMarker?.(turn.id);
-                  }}
-                >
-                  <Bookmark
-                    size={18}
-                    fill={turn.isMarked ? "currentColor" : "none"}
-                  />
-                </button>
-                <button
-                  className={turn.needsReview ? "is-active" : ""}
-                  type="button"
-                  aria-label="More transcript actions"
-                  aria-expanded={openTurnMenu === turn.id}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setOpenTurnMenu((current) =>
-                      current === turn.id ? undefined : turn.id,
-                    );
-                  }}
-                >
-                  {turn.needsReview ? (
-                    <MessageSquare size={17} fill="currentColor" />
-                  ) : (
-                    <MoreVertical size={18} />
-                  )}
-                </button>
-                {openTurnMenu === turn.id ? (
-                  <div className="transcript-row__menu">
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onToggleReview?.(turn.id);
-                        setOpenTurnMenu(undefined);
-                      }}
-                    >
-                      <MessageSquare size={15} />
-                      {turn.needsReview
-                        ? "Clear review flag"
-                        : "Flag for review"}
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-          </article>
+            turn={turn}
+            speaker={
+              turn.speakerId ? speakerById.get(turn.speakerId) : speakers[0]
+            }
+            search={search}
+            editable={editable}
+            selected={selectedTurnId === turn.id}
+            playbackState={playbackState}
+            activeWordId={active ? activeWordId : undefined}
+            playedWordId={active ? playedWordId : undefined}
+            playbackPositionMs={playbackPositionMs}
+            isLastDraft={turn.id === lastTurnId}
+            menuOpen={openTurnMenu === turn.id}
+            onSelectTurn={selectTurn}
+            onEdit={editTurn}
+            onToggleMarker={toggleMarker}
+            onToggleReview={toggleReview}
+            onToggleMenu={toggleMenu}
+          />
         );
       })}
     </div>

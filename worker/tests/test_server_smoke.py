@@ -53,7 +53,7 @@ def test_sidecar_hello_ping_shutdown_without_ml_dependencies(tmp_path: Path) -> 
     assert messages[0]["event"] == "hello"
     assert messages[0]["protocol_version"] == "1.0"
     assert messages[0]["payload"]["protocol_version"] == "1.0"
-    assert messages[0]["payload"]["pipeline_version"] == "2026.07.28.1"
+    assert messages[0]["payload"]["pipeline_version"] == "2026.08.13.1"
     assert messages[0]["payload"]["setup_enabled"] is True
     assert messages[1]["request_id"] == "ping-1"
     assert messages[1]["result"]["pong"] is True

@@ -184,4 +184,60 @@ describe("TranscriptRows playback alignment", () => {
 
     expect(onEdit).not.toHaveBeenCalled();
   });
+
+  it("marks completed rows and words from the discrete playback cursor", () => {
+    render(
+      <TranscriptRows
+        turns={[
+          {
+            id: "turn-1",
+            speakerId: "speaker-1",
+            startMs: 0,
+            endMs: 500,
+            modelText: "First turn",
+            words: [
+              { id: "word-1", text: "First", startMs: 0, endMs: 250 },
+              { id: "word-2", text: "turn", startMs: 250, endMs: 500 },
+            ],
+          },
+          {
+            id: "turn-2",
+            speakerId: "speaker-1",
+            startMs: 500,
+            endMs: 1_000,
+            modelText: "Second turn",
+            words: [
+              { id: "word-3", text: "Second", startMs: 500, endMs: 750 },
+              { id: "word-4", text: "turn", startMs: 750, endMs: 1_000 },
+            ],
+          },
+        ]}
+        speakers={[
+          {
+            id: "speaker-1",
+            displayName: "Speaker 1",
+            initials: "S1",
+            color: "#0868df",
+            state: "Unknown",
+          },
+        ]}
+        activeTurnId="turn-2"
+        activeWordId="word-4"
+        playedWordId="word-3"
+      />,
+    );
+
+    expect(screen.getByText("First").closest(".transcript-word")).toHaveClass(
+      "is-played",
+    );
+    expect(screen.getByText("Second").closest(".transcript-word")).toHaveClass(
+      "is-played",
+    );
+    expect(screen.getAllByText("turn")[1].closest(".transcript-word")).toHaveClass(
+      "is-current",
+    );
+    expect(screen.getAllByText("turn")[1].closest(".transcript-word")).not.toHaveClass(
+      "is-played",
+    );
+  });
 });

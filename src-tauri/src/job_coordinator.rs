@@ -7,7 +7,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -24,12 +24,15 @@ use crate::{
     error::{CoreError, CoreResult},
     layout::{managed_child_directory, remove_managed_child_tree},
     media,
+    performance::PerformanceSpan,
     service::{CoreService, VOICE_PROFILE_MIN_CLEAN_DURATION_MS, VOICE_PROFILE_MIN_SAMPLES},
     worker::{worker_compatible_path, WorkerRequest, WorkerSupervisor, PIPELINE_VERSION},
 };
 
-const IDLE_POLL: Duration = Duration::from_millis(750);
+const IDLE_SAFETY_POLL: Duration = Duration::from_secs(60);
+const ERROR_RETRY_DELAY: Duration = Duration::from_secs(2);
 const ACTIVE_POLL: Duration = Duration::from_millis(150);
+const CANCEL_STATUS_POLL: Duration = Duration::from_millis(750);
 const RETRY_DELAY_MS: i64 = 5_000;
 const MAX_CANONICAL_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -37,6 +40,7 @@ const MAX_CANONICAL_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 /// execution, but Rust remains authoritative for job state and SQLite writes.
 pub struct JobCoordinator {
     stop: Arc<AtomicBool>,
+    core: Arc<CoreService>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -48,12 +52,14 @@ impl JobCoordinator {
     ) -> CoreResult<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let thread_core = core.clone();
         let handle = thread::Builder::new()
             .name("durable-processing-queue".into())
-            .spawn(move || coordinator_loop(core, worker, app, thread_stop))
+            .spawn(move || coordinator_loop(thread_core, worker, app, thread_stop))
             .map_err(CoreError::Io)?;
         Ok(Self {
             stop,
+            core,
             handle: Mutex::new(Some(handle)),
         })
     }
@@ -62,6 +68,7 @@ impl JobCoordinator {
 impl Drop for JobCoordinator {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.core.notify_processing_queue();
         // A pipeline can be inside a native ML call for a while. Detach here so
         // application shutdown is never held hostage; startup recovery changes
         // the still-running DB row to retry_wait.
@@ -109,8 +116,9 @@ fn coordinator_loop(
 ) {
     let worker_id = format!("desktop-{}", Uuid::now_v7());
     while !stop.load(Ordering::Relaxed) {
+        let observed_generation = core.processing_queue_generation();
         match claim_next_job(&core, &worker_id) {
-            Ok(Some(job)) => {
+            Ok(ClaimResult::Claimed(job)) => {
                 emit_job(&core, &app, &job.id);
                 if let Err(error) = run_claimed_job(&core, &worker, &app, &stop, &job) {
                     let _ = fail_job(&core, &job, "HOST_PIPELINE_ERROR", &error.to_string(), true);
@@ -121,19 +129,45 @@ fn coordinator_loop(
                     );
                 }
             }
-            Ok(None) => thread::sleep(IDLE_POLL),
+            Ok(ClaimResult::Idle { retry_at_ms }) => {
+                core.wait_for_processing_queue_change(
+                    observed_generation,
+                    idle_wait_duration(now_ms(), retry_at_ms),
+                );
+            }
             Err(error) => {
                 log::error!("processing queue poll failed: {error}");
-                thread::sleep(IDLE_POLL);
+                core.wait_for_processing_queue_change(observed_generation, ERROR_RETRY_DELAY);
             }
         }
     }
 }
 
-fn claim_next_job(core: &CoreService, worker_id: &str) -> CoreResult<Option<ClaimedJob>> {
+#[derive(Debug)]
+enum ClaimResult {
+    Claimed(ClaimedJob),
+    Idle { retry_at_ms: Option<i64> },
+}
+
+fn claim_next_job(core: &CoreService, worker_id: &str) -> CoreResult<ClaimResult> {
     let now = now_ms();
     let retry_before = now.saturating_sub(RETRY_DELAY_MS);
     let mut connection = core.database().connect()?;
+
+    // Inspect with a read-only query first. The previous loop opened an
+    // IMMEDIATE transaction every 750 ms even when the queue was empty, which
+    // needlessly acquired SQLite's reserved writer lock while the app idled.
+    let (queued, retry_at_ms): (bool, Option<i64>) = connection.query_row(
+        "SELECT
+            EXISTS(SELECT 1 FROM processing_jobs WHERE status='queued'),
+            (SELECT MIN(updated_at_ms + ?1) FROM processing_jobs WHERE status='retry_wait')",
+        [RETRY_DELAY_MS],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if !queued && retry_at_ms.is_none_or(|retry_at| retry_at > now) {
+        return Ok(ClaimResult::Idle { retry_at_ms });
+    }
+
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = transaction
         .query_row(
@@ -157,7 +191,7 @@ fn claim_next_job(core: &CoreService, worker_id: &str) -> CoreResult<Option<Clai
         .optional()?;
     let Some((id, meeting_id, attempts, max_attempts, output_json)) = row else {
         transaction.commit()?;
-        return Ok(None);
+        return Ok(ClaimResult::Idle { retry_at_ms });
     };
     let changed = transaction.execute(
         "UPDATE processing_jobs
@@ -168,20 +202,29 @@ fn claim_next_job(core: &CoreService, worker_id: &str) -> CoreResult<Option<Clai
     )?;
     if changed != 1 {
         transaction.commit()?;
-        return Ok(None);
+        return Ok(ClaimResult::Idle { retry_at_ms });
     }
     transaction.commit()?;
     let output = output_json
         .as_deref()
         .and_then(|value| serde_json::from_str(value).ok())
         .unwrap_or_else(|| json!({}));
-    Ok(Some(ClaimedJob {
+    Ok(ClaimResult::Claimed(ClaimedJob {
         id,
         meeting_id,
         attempts: attempts.saturating_add(1) as u32,
         max_attempts: max_attempts as u32,
         output,
     }))
+}
+
+fn idle_wait_duration(current_ms: i64, retry_at_ms: Option<i64>) -> Duration {
+    retry_at_ms
+        .map(|retry_at| {
+            Duration::from_millis(retry_at.saturating_sub(current_ms).max(0) as u64)
+                .min(IDLE_SAFETY_POLL)
+        })
+        .unwrap_or(IDLE_SAFETY_POLL)
 }
 
 fn run_claimed_job(
@@ -191,6 +234,7 @@ fn run_claimed_job(
     stop: &AtomicBool,
     job: &ClaimedJob,
 ) -> CoreResult<()> {
+    let _span = PerformanceSpan::new("final_processing", "source=durable_queue");
     let payload = build_pipeline_payload(core, job)?;
     let mut request = WorkerRequest::new("pipeline.run", payload);
     request.job_id = Some(job.id.clone());
@@ -198,15 +242,20 @@ fn run_claimed_job(
     worker.request(request)?;
 
     let mut cancel_sent = false;
+    let mut next_cancel_check = Instant::now();
     loop {
+        let observed_generation = core.processing_queue_generation();
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if !cancel_sent && job_status(core, &job.id)?.as_deref() == Some("cancel_requested") {
-            let mut request = WorkerRequest::new("pipeline.cancel", json!({"job_id":job.id}));
-            request.job_id = Some(job.id.clone());
-            let _ = worker.request(request);
-            cancel_sent = true;
+        if !cancel_sent && Instant::now() >= next_cancel_check {
+            if job_status(core, &job.id)?.as_deref() == Some("cancel_requested") {
+                let mut request = WorkerRequest::new("pipeline.cancel", json!({"job_id":job.id}));
+                request.job_id = Some(job.id.clone());
+                let _ = worker.request(request);
+                cancel_sent = true;
+            }
+            next_cancel_check = Instant::now() + CANCEL_STATUS_POLL;
         }
 
         for mut event in worker.drain_job_events(&job.id) {
@@ -286,7 +335,12 @@ fn run_claimed_job(
                     .unwrap_or_else(|| "worker exited during final processing".into()),
             ));
         }
-        thread::sleep(ACTIVE_POLL);
+        if core.wait_for_processing_queue_change(observed_generation, ACTIVE_POLL) {
+            // Queue notifications include cancellation requests. Check those
+            // immediately while retaining a low-frequency safety query for
+            // changes made by an older process that cannot signal us.
+            next_cancel_check = Instant::now();
+        }
     }
 }
 
@@ -490,6 +544,8 @@ fn recording_microphone_is_personal(
 }
 
 fn load_confirmed_profiles(core: &CoreService) -> CoreResult<Vec<Value>> {
+    type ProfileGroup = (String, Vec<i64>, Vec<Vec<f32>>);
+
     let connection = core.database().connect()?;
     let mut statement = connection.prepare(
         "SELECT p.id,p.display_name,s.clean_duration_ms,s.encrypted_embedding
@@ -518,7 +574,7 @@ fn load_confirmed_profiles(core: &CoreService) -> CoreResult<Vec<Value>> {
             },
         )?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut grouped: BTreeMap<String, (String, Vec<i64>, Vec<Vec<f32>>)> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, ProfileGroup> = BTreeMap::new();
     for (profile_id, name, duration, encrypted) in rows {
         let mut clear = crypto::unprotect_embedding(&encrypted)?;
         let decoded = decode_embedding(&clear);
@@ -548,7 +604,7 @@ fn decode_embedding(bytes: &[u8]) -> CoreResult<Vec<f32>> {
     let vector = if bytes.first() == Some(&b'[') {
         serde_json::from_slice::<Vec<f32>>(bytes)
             .map_err(|_| CoreError::Security("stored voice embedding JSON is invalid".into()))?
-    } else if !bytes.is_empty() && bytes.len() % 4 == 0 {
+    } else if !bytes.is_empty() && bytes.len().is_multiple_of(4) {
         bytes
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -773,6 +829,7 @@ fn commit_canonical_result(
             job.id
         );
     }
+    core.invalidate_library_size_cache();
     Ok(())
 }
 
@@ -1382,6 +1439,68 @@ fn namespaced_id(meeting_id: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue_fixture(status: &str, updated_at_ms: i64) -> (tempfile::TempDir, CoreService, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let core = CoreService::open(temp.path()).unwrap();
+        let meeting_id = Uuid::now_v7().to_string();
+        let job_id = Uuid::now_v7().to_string();
+        let connection = core.database().connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO meetings(id,title,source_kind,status,created_at_ms)
+                 VALUES (?1,'Queue','import','processing',?2)",
+                params![meeting_id, updated_at_ms],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO processing_jobs(
+                    id,meeting_id,stage,status,progress,input_json,created_at_ms,updated_at_ms
+                 ) VALUES (?1,?2,'normalize',?3,0,'{}',?4,?4)",
+                params![job_id, meeting_id, status, updated_at_ms],
+            )
+            .unwrap();
+        drop(connection);
+        (temp, core, job_id)
+    }
+
+    #[test]
+    fn queue_claims_ready_work_and_reports_retry_deadlines() {
+        let (_temp, core, queued_id) = queue_fixture("queued", now_ms());
+        let claimed = claim_next_job(&core, "test-worker").unwrap();
+        assert!(matches!(
+            claimed,
+            ClaimResult::Claimed(ClaimedJob { id, .. }) if id == queued_id
+        ));
+        assert_eq!(
+            job_status(&core, &queued_id).unwrap().as_deref(),
+            Some("running")
+        );
+
+        let (_temp, core, _) = queue_fixture("retry_wait", now_ms());
+        let inspected_at = now_ms();
+        let idle = claim_next_job(&core, "test-worker").unwrap();
+        let ClaimResult::Idle {
+            retry_at_ms: Some(retry_at_ms),
+        } = idle
+        else {
+            panic!("a fresh retry_wait job should expose its future deadline");
+        };
+        assert!(retry_at_ms > inspected_at);
+        assert!(idle_wait_duration(inspected_at, Some(retry_at_ms)) <= IDLE_SAFETY_POLL);
+    }
+
+    #[test]
+    fn retry_deadline_wait_is_capped_by_the_safety_poll() {
+        assert_eq!(idle_wait_duration(1_000, None), IDLE_SAFETY_POLL);
+        assert_eq!(
+            idle_wait_duration(1_000, Some(1_250)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(idle_wait_duration(2_000, Some(1_000)), Duration::ZERO);
+        assert_eq!(idle_wait_duration(0, Some(i64::MAX)), IDLE_SAFETY_POLL);
+    }
 
     #[test]
     fn legacy_verbatim_resume_is_discarded_before_native_worker_retry() {

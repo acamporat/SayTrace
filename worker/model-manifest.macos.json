@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "pipeline_version": "2026.08.13.1",
+  "models": [
+    {
+      "key": "live_asr_en",
+      "purpose": "live English draft transcription on Apple Silicon",
+      "repository": "mlx-community/whisper-small.en-mlx-q4",
+      "revision": "fe4cb9d513528cc96ccff1dd7b78c88379cb673b",
+      "license": "MIT",
+      "gated": false,
+      "files": [
+        {
+          "path": "config.json",
+          "size": 339,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "3a41c6d4b606f218551045c91a7c4fff0ef05b943c6dd4f4d29a3d6ca35ef212"
+          }
+        },
+        {
+          "path": "weights.npz",
+          "size": 196535960,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "35062fc50b7190b536dc43c01e314b6d76177aa8b4438195011bcee97bf9458a"
+          }
+        }
+      ]
+    },
+    {
+      "key": "final_asr_en",
+      "purpose": "canonical English transcription on Apple Silicon",
+      "repository": "mlx-community/whisper-large-v3-turbo-q4",
+      "revision": "660c343bbf4e52ac257f0b7d952e5388e6f93bef",
+      "license": "MIT",
+      "gated": false,
+      "files": [
+        {
+          "path": "config.json",
+          "size": 341,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "538e24557b8f9bc504700add5e7bbe32087c2353001ff563e64772ad4398671a"
+          }
+        },
+        {
+          "path": "weights.npz",
+          "size": 463664664,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "862bbc832b05f3f4ec19dd632b701d61a6d3f5c7906360a10d72a79870642a80"
+          }
+        }
+      ]
+    },
+    {
+      "key": "diarization",
+      "purpose": "exclusive and overlapping speaker diarization",
+      "repository": "pyannote/speaker-diarization-community-1",
+      "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
+      "license": "CC-BY-4.0",
+      "gated": true,
+      "files": [
+        {
+          "path": "config.yaml",
+          "size": 444,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "5ce2bfa9a938dc132cec1172592d65173cbb8f444ea1e4133f10f9391de155be"
+          }
+        },
+        {
+          "path": "embedding/pytorch_model.bin",
+          "size": 26646242,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"
+          }
+        },
+        {
+          "path": "plda/plda.npz",
+          "size": 133852,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "9b77bcd840692710dd3496f62ecfeed8d8e5f002fd991b785079b244eab7d255"
+          }
+        },
+        {
+          "path": "plda/xvec_transform.npz",
+          "size": 134376,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "325f1ce8e48f7e55e9c8aa47e05d2766b7c48c4b25b8de8dd751e7a4cc5fbe8f"
+          }
+        },
+        {
+          "path": "segmentation/pytorch_model.bin",
+          "size": 5906507,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "7ad24338d844fb95985486eb1a464e32d229f6d7a03c9abe60f978bacf3f816e"
+          }
+        }
+      ]
+    },
+    {
+      "key": "speaker_embedding",
+      "purpose": "local known-speaker embeddings",
+      "repository": "pyannote/wespeaker-voxceleb-resnet34-LM",
+      "revision": "837717ddb9ff5507820346191109dc79c958d614",
+      "license": "CC-BY-4.0",
+      "gated": false,
+      "files": [
+        {
+          "path": "config.yaml",
+          "size": 221,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "6ff718cff3c5d7a4493537ab7f4780cad7e3d32453f59099b4076aefa07a9974"
+          }
+        },
+        {
+          "path": "pytorch_model.bin",
+          "size": 26645418,
+          "hash": {
+            "algorithm": "sha256",
+            "value": "366edf44f4c80889a3eb7a9d7bdf02c4aede3127f7dd15e274dcdb826b143c56"
+          }
+        }
+      ]
+    }
+  ]
+}

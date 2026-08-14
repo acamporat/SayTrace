@@ -1,6 +1,11 @@
 # SayTrace
 
-SayTrace is a Windows-first desktop application for private meeting capture, audio/video transcription, and conservative speaker identification. Microphone and system audio are recorded locally as separate sources, live captions are treated as disposable drafts, and the canonical transcript is rebuilt from the saved media after recording stops.
+SayTrace is a cross-platform desktop application for private meeting capture,
+audio/video transcription, and conservative speaker identification. Windows
+uses NVIDIA CUDA when available; Apple Silicon Macs use MLX/Metal. Microphone
+and system audio are recorded locally as separate sources, live captions are
+treated as disposable drafts, and the canonical transcript is rebuilt from the
+saved media after recording stops.
 
 The application does not use a cloud transcription service. It enables network
 access only during explicit model setup for the revision-pinned files declared by
@@ -45,13 +50,41 @@ sends transcript text to a hosted model.
 
 ## Development prerequisites
 
+### Windows
+
 - Windows 11 x64
 - Node.js 22 and npm
 - Rust 1.88+ with the MSVC Windows target
 - Python 3.13 managed through [uv](https://docs.astral.sh/uv/)
 - FFmpeg and FFprobe for development imports
 
-The normal production installer includes the locked Python worker, NVIDIA CUDA
+### macOS Apple Silicon development
+
+The macOS port targets Apple Silicon on macOS 15+ and uses Apple
+MLX/Metal for speech recognition instead of NVIDIA CUDA. Install Node.js 22,
+Rust 1.88+, `uv`, FFmpeg/FFprobe, and the Xcode command-line tools, then run:
+
+```bash
+npm ci
+uv sync --project worker --extra ml --group dev
+./script/build_and_run.sh --verify
+```
+
+The Codex **Run** action uses that same build-and-run script. macOS will request
+Microphone and Screen & System Audio Recording access the first time recording
+is used. See [macOS development](docs/macos.md) for setup, permissions, checks,
+debug/log modes, and the current packaging limitations.
+
+The normal macOS run path is release-optimized. When live captions are off,
+SayTrace prewarms the final MLX and diarization models during recording, keeps
+heavy backends in a hardware-adaptive resident cache between jobs, and releases
+idle entries after two to ten minutes. On 8 GB Macs, inference returns to
+stage-bounded model release and prewarms final ASR only. Final media
+normalization and track consolidation use bounded parallelism, while the
+renderer avoids high-frequency React updates for meters, playback, and large
+transcripts.
+
+The Windows production installer includes the locked Python worker, NVIDIA CUDA
 runtime with CPU fallback, LGPL-compatible FFmpeg, and automatic WebView2
 setup. Before copying SayTrace, setup verifies Windows, free storage, the
 runtime manifest and entrypoints, the worker handshake, GPU capability, Ollama,
@@ -120,7 +153,10 @@ The release gate also requires:
 - Audio, video, transcripts, and model files stay in the local application-data library.
 - Transcript questions are sent only to the local Ollama loopback endpoint; hosted Ollama models are excluded.
 - Voice embeddings are protected with Windows DPAPI for the current user.
+- On macOS, voice embeddings are protected with an AES key stored in the
+  current user's Keychain.
 - Audio and transcript files are not separately encrypted by the application; use BitLocker for whole-library at-rest encryption.
+- On macOS, use FileVault for whole-library encryption at rest.
 - The worker runs in explicit offline mode after model setup and has no listening network port.
 - Weak or ambiguous speaker matches remain `Unknown`.
 

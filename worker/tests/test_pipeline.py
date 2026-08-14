@@ -180,6 +180,21 @@ def test_pipeline_runs_with_fakes_and_resumes_batches(tmp_path: Path) -> None:
     index_data = json.loads(index_path.read_text(encoding="utf-8"))
     assert index_data["speaker_matches"] == data["speaker_matches"]
     assert any(event == "pipeline_batch" for event, _payload in events)
+    stage_timings = [
+        payload
+        for event, payload in events
+        if event == "performance_timing" and payload["scope"] == "pipeline_stage"
+    ]
+    assert [payload["stage"] for payload in stage_timings] == [
+        "normalize",
+        "transcribe",
+        "align",
+        "diarize",
+        "merge",
+        "identify",
+        "index_finalize",
+    ]
+    assert all("path" not in json.dumps(payload).casefold() for payload in stage_timings)
     for artifact_path in checkpoint.stage_results.values():
         artifact_text = Path(artifact_path).read_text(encoding="utf-8")
         assert "embedding" not in artifact_text.casefold()
@@ -322,12 +337,14 @@ def test_oom_retry_releases_large_batch_before_smaller_fallback() -> None:
     assert first.released is True
 
 
-def test_pipeline_releases_each_heavy_stage_before_loading_the_next(tmp_path: Path) -> None:
+@pytest.mark.parametrize("release_after_stage", [False, True])
+def test_pipeline_backend_peak_lifetime_policy(tmp_path: Path, release_after_stage: bool) -> None:
     active: set[str] = set()
     lifecycle: list[str] = []
 
     def enter(stage: str) -> None:
-        assert not active
+        if release_after_stage:
+            assert not active
         active.add(stage)
         lifecycle.append(f"load:{stage}")
 
@@ -379,6 +396,7 @@ def test_pipeline_releases_each_heavy_stage_before_loading_the_next(tmp_path: Pa
         embedder=TrackingEmbedder(),
         emit=lambda _event, _payload: None,
         correlation_factory=lambda paths: lambda left, right: None,
+        release_backends_after_stage=release_after_stage,
     )
     request = PipelineInput(
         job_id="job-lifecycle",
@@ -393,14 +411,133 @@ def test_pipeline_releases_each_heavy_stage_before_loading_the_next(tmp_path: Pa
 
     pipeline.run(request, threading.Event())
 
-    assert active == set()
-    assert lifecycle == [
-        "load:transcribe",
-        "release:transcribe",
-        "load:align",
-        "release:align",
-        "load:diarize",
-        "release:diarize",
-        "load:identify",
-        "release:identify",
+    if release_after_stage:
+        assert active == set()
+        assert lifecycle == [
+            "load:transcribe",
+            "release:transcribe",
+            "load:align",
+            "release:align",
+            "load:diarize",
+            "release:diarize",
+            "load:identify",
+            "release:identify",
+        ]
+    else:
+        assert active == {"transcribe", "align", "diarize", "identify"}
+        assert lifecycle == [
+            "load:transcribe",
+            "load:align",
+            "load:diarize",
+            "load:identify",
+        ]
+
+
+def test_pipeline_normalizes_independent_sources_concurrently_in_source_order(
+    tmp_path: Path,
+) -> None:
+    class ConcurrentNormalizer(FakeNormalizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.maximum_active = 0
+            self.lock = threading.Lock()
+            self.all_started = threading.Event()
+
+        def normalize(self, source: Path, target: Path, cancel: threading.Event) -> Path:
+            with self.lock:
+                self.active += 1
+                self.maximum_active = max(self.maximum_active, self.active)
+                if self.active == 2:
+                    self.all_started.set()
+            try:
+                assert self.all_started.wait(timeout=2)
+                return super().normalize(source, target, cancel)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    sources = []
+    for asset_id in ("first", "second"):
+        path = tmp_path / f"{asset_id}.wav"
+        path.write_bytes(asset_id.encode())
+        sources.append(SourceAsset(asset_id, path, "import", priority=20))
+    workspace = tmp_path / "job"
+    workspace.mkdir()
+    normalizer = ConcurrentNormalizer()
+    events: list[tuple[str, dict[str, object]]] = []
+    pipeline = FinalPipeline(
+        normalizer=normalizer,
+        transcriber=FakeTranscriber(),
+        aligner=FakeAligner(),
+        diarizer=FakeDiarizer(),
+        embedder=FakeEmbedder(),
+        emit=lambda event, payload: events.append((event, payload)),
+        correlation_factory=lambda paths: lambda left, right: None,
+    )
+    request = PipelineInput(
+        job_id="job-parallel-normalize",
+        pipeline_version="pipeline-1",
+        sources=tuple(sources),
+        workspace=workspace,
+        diarization_asset_id="first",
+        profiles=(),
+        match_policy=None,
+        checkpoint=PipelineCheckpoint("pipeline-1"),
+    )
+
+    pipeline.run(request, threading.Event())
+
+    assert normalizer.maximum_active == 2
+    normalize_progress = [
+        payload["completed_batches"]
+        for event, payload in events
+        if event == "job_progress" and payload["stage"] == "normalize"
     ]
+    assert normalize_progress == [1, 2]
+
+
+def test_parallel_normalization_reports_errors_in_source_order(tmp_path: Path) -> None:
+    class ReverseFailureNormalizer(FakeNormalizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.second_started = threading.Event()
+
+        def normalize(self, source: Path, target: Path, cancel: threading.Event) -> Path:
+            del target, cancel
+            if source.stem == "first":
+                assert self.second_started.wait(timeout=2)
+                raise WorkerError(ErrorCode.BAD_REQUEST, "first source failed")
+            self.second_started.set()
+            raise WorkerError(ErrorCode.UNSUPPORTED_AUDIO, "second source failed")
+
+    sources = []
+    for asset_id in ("first", "second"):
+        path = tmp_path / f"{asset_id}.wav"
+        path.write_bytes(asset_id.encode())
+        sources.append(SourceAsset(asset_id, path, "import", priority=20))
+    workspace = tmp_path / "job"
+    workspace.mkdir()
+    pipeline = FinalPipeline(
+        normalizer=ReverseFailureNormalizer(),
+        transcriber=FakeTranscriber(),
+        aligner=FakeAligner(),
+        diarizer=FakeDiarizer(),
+        embedder=FakeEmbedder(),
+        emit=lambda _event, _payload: None,
+    )
+    request = PipelineInput(
+        job_id="job-normalize-errors",
+        pipeline_version="pipeline-1",
+        sources=tuple(sources),
+        workspace=workspace,
+        diarization_asset_id="first",
+        profiles=(),
+        match_policy=None,
+        checkpoint=PipelineCheckpoint("pipeline-1"),
+    )
+
+    with pytest.raises(WorkerError, match="first source failed") as raised:
+        pipeline.run(request, threading.Event())
+
+    assert raised.value.code is ErrorCode.BAD_REQUEST

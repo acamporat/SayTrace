@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import re
 import shutil
 import uuid
@@ -54,12 +55,17 @@ class ModelManifest:
     @classmethod
     def load(cls, path: Path | None = None) -> ModelManifest:
         if path is None:
-            packaged = resources.files("local_transcript_worker").joinpath("model-manifest.json")
+            manifest_name = (
+                "model-manifest.macos.json"
+                if platform.system() == "Darwin" and platform.machine() == "arm64"
+                else "model-manifest.json"
+            )
+            packaged = resources.files("local_transcript_worker").joinpath(manifest_name)
             if packaged.is_file():
                 raw = packaged.read_text(encoding="utf-8")
             else:
                 source_root = Path(__file__).resolve().parents[2]
-                raw = (source_root / "model-manifest.json").read_text(encoding="utf-8")
+                raw = (source_root / manifest_name).read_text(encoding="utf-8")
         else:
             raw = path.read_text(encoding="utf-8")
         try:
@@ -191,7 +197,7 @@ def _download_error(spec: ModelSpec, exc: Exception) -> WorkerError:
     return WorkerError(
         ErrorCode.MODEL_DOWNLOAD_FAILED,
         (
-            f"Could not download model pack {spec.key!r}. Check this PC's "
+            f"Could not download model pack {spec.key!r}. Check this computer's "
             "internet connection and retry."
         ),
         details,

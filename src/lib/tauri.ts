@@ -17,6 +17,7 @@ import type {
   RecordingSession,
   RecordingStatus,
   RenameSpeakerResult,
+  StartupChangedEvent,
   TranscriptTurn,
   TranscriptChatMessage,
   VoiceProfile,
@@ -237,6 +238,7 @@ export interface EventMap {
   "model://setup-progress": ModelSetupProgressEvent;
   "worker://health": WorkerHealthEvent;
   "device://warning": DeviceWarningEvent;
+  "startup://changed": StartupChangedEvent;
 }
 
 export function isTauriRuntime() {

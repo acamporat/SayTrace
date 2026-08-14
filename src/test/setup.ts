@@ -4,5 +4,10 @@ import { cleanup } from "@testing-library/react";
 
 afterEach(() => {
   cleanup();
-  window.localStorage.clear();
+  // Node 25 exposes an incomplete global localStorage when no backing file is
+  // configured. JSDOM inherits it in that environment, so clear only when the
+  // browser Storage API is actually available.
+  if (typeof window.localStorage.clear === "function") {
+    window.localStorage.clear();
+  }
 });

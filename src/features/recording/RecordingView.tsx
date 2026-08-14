@@ -14,16 +14,19 @@ import {
   Volume2,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { LevelMeter } from "../../components/LevelMeter";
+import {
+  LevelMeter,
+  type LevelMeterHandle,
+} from "../../components/LevelMeter";
 import { TranscriptRows } from "../../components/TranscriptRows";
 import { formatDuration } from "../../lib/format";
+import { isTauriRuntime, listenEvent } from "../../lib/tauri";
 import type {
   AudioDevice,
   Marker,
   Meeting,
   MeetingSpeaker,
   RecordingSession,
-  RecordingLevels,
   RecordingStatus,
   TranscriptTurn,
 } from "../../types";
@@ -36,7 +39,6 @@ interface RecordingViewProps {
   markers: Marker[];
   session?: RecordingSession;
   status: RecordingStatus;
-  levels: RecordingLevels;
   microphoneDeviceId: string;
   outputDeviceId: string;
   microphoneIsPersonal: boolean;
@@ -56,7 +58,6 @@ export function RecordingView({
   markers,
   session,
   status,
-  levels,
   microphoneDeviceId,
   outputDeviceId,
   microphoneIsPersonal,
@@ -79,6 +80,38 @@ export function RecordingView({
   const [renamingMeeting, setRenamingMeeting] = useState(false);
   const [meetingTitleDraft, setMeetingTitleDraft] = useState(meeting.title);
   const liveDraftScrollRef = useRef<HTMLDivElement>(null);
+  const microphoneMeterRef = useRef<LevelMeterHandle>(null);
+  const systemMeterRef = useRef<LevelMeterHandle>(null);
+  const latestLevelsRef = useRef({
+    microphone: isTauriRuntime() ? 0 : 0.62,
+    system: isTauriRuntime() ? 0 : 0.59,
+  });
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
+
+  useEffect(() => {
+    let alive = true;
+    let dispose: (() => void) | undefined;
+    void listenEvent("recording://levels", (levels) => {
+      latestLevelsRef.current = levels;
+      if (pausedRef.current) return;
+      microphoneMeterRef.current?.setLevel(levels.microphone);
+      systemMeterRef.current?.setLevel(levels.system);
+    }).then((unlisten) => {
+      if (alive) dispose = unlisten;
+      else unlisten();
+    });
+    return () => {
+      alive = false;
+      dispose?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const levels = latestLevelsRef.current;
+    microphoneMeterRef.current?.setLevel(paused ? 0 : levels.microphone);
+    systemMeterRef.current?.setLevel(paused ? 0 : levels.system);
+  }, [paused]);
 
   useEffect(() => {
     if (session) setElapsed(session.elapsedMs);
@@ -200,7 +233,11 @@ export function RecordingView({
               </select>
               <ChevronDown size={16} />
             </label>
-            <LevelMeter level={paused ? 0 : levels.microphone} />
+            <LevelMeter
+              ref={microphoneMeterRef}
+              level={paused ? 0 : latestLevelsRef.current.microphone}
+              label="Microphone input level"
+            />
             <Volume2 size={18} />
             <input
               className="volume-slider"
@@ -210,7 +247,7 @@ export function RecordingView({
               step={0.01}
               defaultValue={0.74}
               disabled
-              aria-label="Microphone monitor level (controlled by Windows)"
+              aria-label="Microphone monitor level (controlled by macOS)"
             />
           </div>
           <div className="source-row">
@@ -233,7 +270,11 @@ export function RecordingView({
               </select>
               <ChevronDown size={16} />
             </label>
-            <LevelMeter level={paused ? 0 : levels.system} />
+            <LevelMeter
+              ref={systemMeterRef}
+              level={paused ? 0 : latestLevelsRef.current.system}
+              label="System audio input level"
+            />
             <Volume2 size={18} />
             <input
               className="volume-slider"
@@ -243,7 +284,7 @@ export function RecordingView({
               step={0.01}
               defaultValue={0.66}
               disabled
-              aria-label="System audio monitor level (controlled by Windows)"
+              aria-label="System audio monitor level (controlled by macOS)"
             />
           </div>
 

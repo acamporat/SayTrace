@@ -99,10 +99,10 @@ export function VoiceProfilesView({
       <div className="profile-privacy">
         <ShieldCheck size={21} />
         <div>
-          <strong>Encrypted on this Windows account</strong>
+          <strong>Protected with your macOS Keychain</strong>
           <p>
-            Voice signatures are protected with Windows DPAPI and never leave
-            this device.
+            Voice signatures are encrypted with a key stored in your login
+            Keychain and never leave this Mac.
           </p>
         </div>
       </div>

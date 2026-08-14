@@ -48,30 +48,46 @@ impl MediaTool {
 /// Debug builds may fall back to an explicitly installed development tool on
 /// PATH. Release builds never execute a same-named binary from PATH.
 pub fn resolve(layout: &AppLayout, tool: MediaTool) -> CoreResult<PathBuf> {
-    let development_path = cfg!(debug_assertions)
+    let development_path = cfg!(any(debug_assertions, feature = "development-runtime"))
         .then(|| env::var_os("PATH"))
         .flatten();
-    resolve_with_development_path(layout.runtime(), tool, development_path.as_deref())
+    let runtime_validated = if layout.runtime_validation_required() {
+        // Release startup validates the large immutable runtime in the
+        // background. A user action that arrives first waits for that exact
+        // validation result instead of falling back to an unverified binary.
+        layout.ensure_runtime_validated()?
+    } else {
+        false
+    };
+    resolve_with_development_path(
+        layout.runtime(),
+        runtime_validated,
+        tool,
+        development_path.as_deref(),
+    )
 }
 
 fn resolve_with_development_path(
     runtime: &Path,
+    runtime_validated: bool,
     tool: MediaTool,
     development_path: Option<&OsStr>,
 ) -> CoreResult<PathBuf> {
     let executable = tool.executable_name();
     let canonical_runtime = runtime.canonicalize()?;
-    for candidate in [
-        runtime.join(executable),
-        runtime.join("bin").join(executable),
-        runtime.join("ffmpeg").join("bin").join(executable),
-    ] {
-        if !candidate.is_file() {
-            continue;
-        }
-        let canonical = candidate.canonicalize()?;
-        if canonical.starts_with(&canonical_runtime) {
-            return Ok(canonical);
+    if runtime_validated {
+        for candidate in [
+            runtime.join(executable),
+            runtime.join("bin").join(executable),
+            runtime.join("ffmpeg").join("bin").join(executable),
+        ] {
+            if !candidate.is_file() {
+                continue;
+            }
+            let canonical = candidate.canonicalize()?;
+            if canonical.starts_with(&canonical_runtime) {
+                return Ok(canonical);
+            }
         }
     }
 
@@ -122,7 +138,7 @@ mod tests {
         let path = joined_path(&[&development]);
 
         let resolved =
-            resolve_with_development_path(&runtime, MediaTool::Ffmpeg, Some(&path)).unwrap();
+            resolve_with_development_path(&runtime, true, MediaTool::Ffmpeg, Some(&path)).unwrap();
 
         assert_eq!(resolved, packaged.canonicalize().unwrap());
     }
@@ -138,7 +154,8 @@ mod tests {
         let path = joined_path(&[&development]);
 
         let resolved =
-            resolve_with_development_path(&runtime, MediaTool::Ffprobe, Some(&path)).unwrap();
+            resolve_with_development_path(&runtime, false, MediaTool::Ffprobe, Some(&path))
+                .unwrap();
 
         assert_eq!(resolved, fallback.canonicalize().unwrap());
     }
@@ -149,7 +166,21 @@ mod tests {
         let runtime = temp.path().join("runtime");
         fs::create_dir_all(&runtime).unwrap();
 
-        let error = resolve_with_development_path(&runtime, MediaTool::Ffmpeg, None).unwrap_err();
+        let error =
+            resolve_with_development_path(&runtime, false, MediaTool::Ffmpeg, None).unwrap_err();
+
+        assert!(matches!(error, CoreError::MediaToolMissing(_)));
+    }
+
+    #[test]
+    fn unvalidated_runtime_tool_is_never_selected() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        executable(&runtime.join(MediaTool::Ffmpeg.executable_name()));
+
+        let error =
+            resolve_with_development_path(&runtime, false, MediaTool::Ffmpeg, None).unwrap_err();
 
         assert!(matches!(error, CoreError::MediaToolMissing(_)));
     }

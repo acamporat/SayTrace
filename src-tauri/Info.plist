@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>SayTrace records microphone audio only when you start a local transcription.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>SayTrace captures system audio only when you choose to include it in a local transcription.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>SayTrace uses screen-capture access only to record the system audio you choose for a local transcription; it does not save screen video.</string>
+</dict>
+</plist>

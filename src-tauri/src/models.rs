@@ -172,6 +172,7 @@ pub struct ProcessingJob {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct ImportMediaRequest {
     pub source_path: String,
     pub title: Option<String>,
@@ -285,6 +286,7 @@ pub struct AgentContextTurn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct UpdateTurnRequest {
     pub turn_id: String,
     pub text: String,
@@ -293,6 +295,7 @@ pub struct UpdateTurnRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct RenameSpeakerRequest {
     pub speaker_id: String,
     pub display_name: String,
@@ -300,6 +303,7 @@ pub struct RenameSpeakerRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct MergeSpeakersRequest {
     pub source_speaker_id: String,
     pub target_speaker_id: String,
@@ -314,6 +318,7 @@ pub struct SetSpeakerReviewRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct CreateVoiceProfileRequest {
     pub display_name: String,
 }
@@ -449,6 +454,7 @@ pub enum ExportFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct ExportTranscriptRequest {
     pub meeting_id: String,
     pub format: ExportFormat,

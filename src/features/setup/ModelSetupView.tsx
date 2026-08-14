@@ -27,13 +27,27 @@ interface ModelSetupViewProps {
   onInstall: (token: string) => Promise<void>;
 }
 
-const modelOrder: ModelSetupKey[] = [
+const standardModelOrder: ModelSetupKey[] = [
   "live_asr_en",
   "final_asr_en",
   "alignment_en",
   "diarization",
   "speaker_embedding",
 ];
+
+const appleMlxModelOrder = standardModelOrder.filter(
+  (key) => key !== "alignment_en",
+);
+
+function usesAppleMlx(status: ModelPackStatus) {
+  const device = status.device.toLocaleLowerCase();
+  if (device.includes("mlx") || device.includes("apple silicon")) return true;
+  if (device.includes("nvidia") || device.includes("cuda")) return false;
+  return (
+    typeof navigator !== "undefined" &&
+    navigator.platform.toLocaleLowerCase().startsWith("mac")
+  );
+}
 
 const modelLabels: Record<ModelSetupKey, string> = {
   live_asr_en: "Live captions",
@@ -82,6 +96,7 @@ export function ModelSetupView({
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string>();
   const runtimeReady = status.runtime === "ready";
+  const runtimeChecking = status.runtime === "checking";
   const modelsInstalled =
     runtimeReady &&
     status.liveModel === "ready" &&
@@ -93,6 +108,8 @@ export function ModelSetupView({
     setInstalled(modelsInstalled);
   }, [modelsInstalled]);
 
+  const isAppleMlx = usesAppleMlx(status);
+  const modelOrder = isAppleMlx ? appleMlxModelOrder : standardModelOrder;
   const perModelProgress = progress
     ? Math.min(
         100,
@@ -152,11 +169,11 @@ export function ModelSetupView({
           <div>
             <ShieldCheck size={21} />
             <strong>Private processing</strong>
-            <span>Media never leaves this PC</span>
+            <span>Media never leaves this Mac</span>
           </div>
           <div>
             <Cpu size={21} />
-            <strong>GPU accelerated</strong>
+            <strong>Apple Silicon accelerated</strong>
             <span>{status.device}</span>
           </div>
         </div>
@@ -169,18 +186,19 @@ export function ModelSetupView({
             <div>
               <h2>Everything is installed</h2>
               <p>
-                Live captions, final transcription, alignment, diarization, and
-                voice matching are available offline.
+                {isAppleMlx
+                  ? "Live captions, final transcription, diarization, and voice matching are available offline."
+                  : "Live captions, final transcription, alignment, diarization, and voice matching are available offline."}
               </p>
             </div>
             <dl>
               <div>
                 <dt>Live captions</dt>
-                <dd>distil-large-v3.5</dd>
+                <dd>{isAppleMlx ? "Whisper Small.en MLX Q4" : "distil-large-v3.5"}</dd>
               </div>
               <div>
                 <dt>Final transcript</dt>
-                <dd>large-v3</dd>
+                <dd>{isAppleMlx ? "Whisper Large v3 Turbo MLX Q4" : "large-v3"}</dd>
               </div>
               <div>
                 <dt>Speaker separation</dt>
@@ -191,20 +209,38 @@ export function ModelSetupView({
               Continue to SayTrace <ChevronRight size={18} />
             </button>
           </section>
+        ) : runtimeChecking ? (
+          <section className="setup-form setup-runtime-required" aria-live="polite">
+            <h2>Verifying local runtime…</h2>
+            <p>
+              SayTrace is checking the bundled MLX worker and media tools before
+              allowing them to run. This can take a moment on first launch.
+            </p>
+            <div className="setup-runtime-handoff">
+              <Cpu size={22} />
+              <span>
+                <strong>Checking signed local components</strong>
+                <small>
+                  Your library remains available locally while verification
+                  finishes. No recording or transcript data is uploaded.
+                </small>
+              </span>
+            </div>
+          </section>
         ) : !runtimeReady ? (
           <section className="setup-form setup-runtime-required">
             <h2>This installation needs repair</h2>
             <p>
-              Local processing is included automatically with the Windows
-              installer, but its files are missing or incomplete on this PC.
+              Local processing is included automatically with the macOS app,
+              but its files are missing or incomplete on this Mac.
             </p>
             <div className="setup-runtime-handoff">
               <Cpu size={22} />
               <span>
                 <strong>Reinstall SayTrace</strong>
                 <small>
-                  Close the app and run the complete SayTrace installer
-                  again. It restores the NVIDIA runtime and CPU fallback without
+                  Close the app and reinstall the complete SayTrace app bundle.
+                  It restores the Apple MLX runtime and CPU fallback without
                   deleting your library.
                 </small>
               </span>

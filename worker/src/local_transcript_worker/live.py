@@ -239,7 +239,7 @@ class LiveDraftManager:
             self._stop.set()
             # Never release a model while the caption thread is inside inference.
             # A bounded failure leaves the manager resident so pipeline.run can
-            # return WORKER_BUSY and retry cleanup instead of racing CUDA teardown.
+            # return WORKER_BUSY and retry cleanup instead of racing accelerator teardown.
             if not self._decode_lock.acquire(timeout=30):
                 return False
             self._decode_lock.release()

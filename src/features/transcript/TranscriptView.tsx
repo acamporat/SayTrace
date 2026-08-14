@@ -25,7 +25,15 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   formatDuration,
   formatLongDate,
@@ -44,7 +52,7 @@ import type {
 } from "../../types";
 import { SpeakerAvatar } from "../../components/SpeakerAvatar";
 import { TranscriptRows } from "../../components/TranscriptRows";
-import { Waveform } from "../../components/Waveform";
+import { Waveform, type WaveformHandle } from "../../components/Waveform";
 import { TranscriptAssistantPanel } from "./TranscriptAssistantPanel";
 
 type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
@@ -287,6 +295,153 @@ function findActiveWordId(
   return word && positionMs < word.endMs ? word.id : undefined;
 }
 
+function findPlayedWordId(
+  words: Array<{ id: string; startMs: number; endMs: number }>,
+  positionMs: number,
+) {
+  let low = 0;
+  let high = words.length - 1;
+  let candidate = -1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (words[middle].endMs <= positionMs) {
+      candidate = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return candidate >= 0 ? words[candidate].id : undefined;
+}
+
+function findActiveTurnIndex(turns: TranscriptTurn[], positionMs: number) {
+  let low = 0;
+  let high = turns.length - 1;
+  let candidate = -1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (turns[middle].startMs <= positionMs) {
+      candidate = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return candidate;
+}
+
+interface PlaybackTranscriptRowsHandle {
+  updatePosition: (positionMs: number) => void;
+}
+
+interface PlaybackTranscriptRowsProps {
+  turns: TranscriptTurn[];
+  speakers: MeetingSpeaker[];
+  search: string;
+  selectedTurnId?: string;
+  autoScroll: boolean;
+  initialPositionMs: number;
+  playing: boolean;
+  scrollRef: React.RefObject<HTMLElement | null>;
+  onSelectTurn: (turnId: string) => void;
+  onEdit: (turnId: string, editedText: string) => void;
+  onToggleMarker: (turnId: string) => void;
+  onToggleReview: (turnId: string) => void;
+}
+
+function playbackCursor(
+  turns: TranscriptTurn[],
+  positionMs: number,
+) {
+  const activeTurnIndex = findActiveTurnIndex(turns, positionMs);
+  const activeTurn = activeTurnIndex >= 0 ? turns[activeTurnIndex] : undefined;
+  const activeWords = activeTurn?.words ?? [];
+  return {
+    activeTurnId: activeTurn?.id,
+    activeWordId: findActiveWordId(activeWords, positionMs),
+    playedWordId: findPlayedWordId(activeWords, positionMs),
+  };
+}
+
+const PlaybackTranscriptRows = forwardRef<
+  PlaybackTranscriptRowsHandle,
+  PlaybackTranscriptRowsProps
+>(function PlaybackTranscriptRows(
+  {
+    turns,
+    speakers,
+    search,
+    selectedTurnId,
+    autoScroll,
+    initialPositionMs,
+    playing,
+    scrollRef,
+    onSelectTurn,
+    onEdit,
+    onToggleMarker,
+    onToggleReview,
+  },
+  forwardedRef,
+) {
+  const positionRef = useRef(initialPositionMs);
+  const [cursor, setCursor] = useState(() =>
+    playbackCursor(turns, initialPositionMs),
+  );
+  const cursorRef = useRef(cursor);
+
+  const updatePosition = useCallback(
+    (positionMs: number) => {
+      positionRef.current = positionMs;
+      const next = playbackCursor(turns, positionMs);
+      const current = cursorRef.current;
+      if (
+        current.activeTurnId === next.activeTurnId &&
+        current.activeWordId === next.activeWordId &&
+        current.playedWordId === next.playedWordId
+      ) {
+        return;
+      }
+      cursorRef.current = next;
+      setCursor(next);
+    },
+    [turns],
+  );
+
+  useImperativeHandle(
+    forwardedRef,
+    () => ({ updatePosition }),
+    [updatePosition],
+  );
+
+  useEffect(() => {
+    updatePosition(positionRef.current);
+  }, [updatePosition]);
+
+  useEffect(() => {
+    if (!autoScroll || !playing || !cursor.activeTurnId) return;
+    scrollRef.current
+      ?.querySelector('[data-playback-active="true"]')
+      ?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [autoScroll, cursor.activeTurnId, playing, scrollRef]);
+
+  return (
+    <TranscriptRows
+      turns={turns}
+      speakers={speakers}
+      search={search}
+      editable
+      selectedTurnId={selectedTurnId}
+      activeTurnId={cursor.activeTurnId}
+      activeWordId={cursor.activeWordId}
+      playedWordId={cursor.playedWordId}
+      onSelectTurn={onSelectTurn}
+      onEdit={onEdit}
+      onToggleMarker={onToggleMarker}
+      onToggleReview={onToggleReview}
+    />
+  );
+});
+
 export function TranscriptView({
   meeting,
   mediaSourceUrl,
@@ -316,9 +471,9 @@ export function TranscriptView({
   onClearTranscriptChat,
   onRefreshAgentStatus,
 }: TranscriptViewProps) {
+  const initialPositionMs = allowSimulatedPlayback ? 767_000 : 0;
   const [search, setSearch] = useState("");
   const [playing, setPlaying] = useState(false);
-  const [position, setPosition] = useState(767_000);
   const [selectedTurn, setSelectedTurn] = useState<string | undefined>(
     () => turns[0]?.id,
   );
@@ -341,8 +496,11 @@ export function TranscriptView({
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptScrollRef = useRef<HTMLElement>(null);
   const speakerPanelRef = useRef<HTMLElement>(null);
-  const activeWordRef = useRef<string>();
-  const [liveActiveWordId, setLiveActiveWordId] = useState<string>();
+  const playbackPositionRef = useRef(initialPositionMs);
+  const mediaDurationRef = useRef(meeting.durationMs);
+  const playbackTimeRef = useRef<HTMLSpanElement>(null);
+  const waveformRef = useRef<WaveformHandle>(null);
+  const playbackRowsRef = useRef<PlaybackTranscriptRowsHandle>(null);
   const selectedSpeakerId = turns.find(
     (turn) => turn.id === selectedTurn,
   )?.speakerId;
@@ -368,27 +526,6 @@ export function TranscriptView({
   const selectedTranscriptTurn = turns.find(
     (turn) => turn.id === selectedTurn,
   );
-  const activeTurnId = useMemo(() => {
-    const active = turns.find(
-      (turn) => position >= turn.startMs && position < turn.endMs,
-    );
-    if (active) return active.id;
-    const earlierTurns = turns.filter((turn) => turn.startMs <= position);
-    return earlierTurns[earlierTurns.length - 1]?.id;
-  }, [position, turns]);
-  const wordTimeline = useMemo(() => {
-    const words = turns.flatMap((turn) => turn.words ?? []);
-    words.sort((left, right) => left.startMs - right.startMs);
-    return words;
-  }, [turns]);
-  const positionActiveWordId = useMemo(
-    () => findActiveWordId(wordTimeline, position),
-    [position, wordTimeline],
-  );
-  const activeWordId =
-    playing && mediaSourceUrl
-      ? liveActiveWordId ?? positionActiveWordId
-      : positionActiveWordId;
   const stageOrder = [
     "ingest",
     "normalize",
@@ -437,42 +574,61 @@ export function TranscriptView({
     selectedCard?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
   }, [selectedSpeakerId]);
 
-  useEffect(() => {
-    if (!playing || !allowSimulatedPlayback || mediaSourceUrl) return;
-    const timer = window.setInterval(
-      () =>
-        setPosition((current) => {
-          if (current >= meeting.durationMs) {
-            setPlaying(false);
-            return 0;
-          }
-          return current + 100 * speed;
-        }),
-      100,
-    );
-    return () => window.clearInterval(timer);
-  }, [allowSimulatedPlayback, mediaSourceUrl, playing, meeting.durationMs, speed]);
+  const syncPlaybackPosition = useCallback((positionMs: number) => {
+    const durationMs = mediaDurationRef.current;
+    const clamped = Math.max(0, Math.min(durationMs, positionMs));
+    playbackPositionRef.current = clamped;
+    if (playbackTimeRef.current) {
+      playbackTimeRef.current.textContent = `${formatDuration(clamped)} / ${formatDuration(
+        durationMs,
+      )}`;
+    }
+    waveformRef.current?.setProgress(durationMs ? clamped / durationMs : 0);
+    playbackRowsRef.current?.updatePosition(clamped);
+  }, []);
 
   useEffect(() => {
-    if (!playing || !mediaSourceUrl || !audioRef.current) {
-      activeWordRef.current = positionActiveWordId;
-      setLiveActiveWordId(positionActiveWordId);
-      return;
-    }
+    mediaDurationRef.current = mediaDuration;
+    syncPlaybackPosition(playbackPositionRef.current);
+  }, [mediaDuration, syncPlaybackPosition]);
+
+  useEffect(() => {
+    setMediaDuration(meeting.durationMs);
+    mediaDurationRef.current = meeting.durationMs;
+    syncPlaybackPosition(playbackPositionRef.current);
+  }, [meeting.durationMs, syncPlaybackPosition]);
+
+  useEffect(() => {
+    syncPlaybackPosition(allowSimulatedPlayback ? 767_000 : 0);
+    setPlaying(false);
+  }, [allowSimulatedPlayback, meeting.id, syncPlaybackPosition]);
+
+  useEffect(() => {
+    if (!playing || !allowSimulatedPlayback || mediaSourceUrl) return;
+    const timer = window.setInterval(() => {
+      const next = playbackPositionRef.current + 100 * speed;
+      if (next >= mediaDurationRef.current) {
+        syncPlaybackPosition(0);
+        setPlaying(false);
+        return;
+      }
+      syncPlaybackPosition(next);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [allowSimulatedPlayback, mediaSourceUrl, playing, speed, syncPlaybackPosition]);
+
+  useEffect(() => {
+    if (!playing || !mediaSourceUrl || !audioRef.current) return;
     let frame = 0;
-    const updateActiveWord = () => {
+    const updatePlayback = () => {
       const media = audioRef.current;
       if (!media) return;
-      const next = findActiveWordId(wordTimeline, media.currentTime * 1000);
-      if (next !== activeWordRef.current) {
-        activeWordRef.current = next;
-        setLiveActiveWordId(next);
-      }
-      frame = window.requestAnimationFrame(updateActiveWord);
+      syncPlaybackPosition(media.currentTime * 1000);
+      frame = window.requestAnimationFrame(updatePlayback);
     };
-    frame = window.requestAnimationFrame(updateActiveWord);
+    frame = window.requestAnimationFrame(updatePlayback);
     return () => window.cancelAnimationFrame(frame);
-  }, [mediaSourceUrl, playing, positionActiveWordId, wordTimeline]);
+  }, [mediaSourceUrl, playing, syncPlaybackPosition]);
 
   useEffect(() => {
     const media = audioRef.current;
@@ -483,19 +639,12 @@ export function TranscriptView({
 
   useEffect(() => {
     if (mediaSourceUrl) {
-      setPosition(0);
+      syncPlaybackPosition(0);
       setPlaying(false);
     }
-  }, [mediaSourceUrl]);
+  }, [mediaSourceUrl, syncPlaybackPosition]);
 
-  useEffect(() => {
-    if (!autoScroll || !playing || !activeTurnId) return;
-    transcriptScrollRef.current
-      ?.querySelector('[data-playback-active="true"]')
-      ?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [activeTurnId, autoScroll, playing]);
-
-  function togglePlayback() {
+  const togglePlayback = useCallback(() => {
     const media = audioRef.current;
     if (mediaSourceUrl && media) {
       if (media.paused) {
@@ -506,15 +655,15 @@ export function TranscriptView({
       return;
     }
     if (allowSimulatedPlayback) setPlaying((value) => !value);
-  }
+  }, [allowSimulatedPlayback, mediaSourceUrl]);
 
-  function seekTo(nextMs: number) {
-    const clamped = Math.max(0, Math.min(mediaDuration, nextMs));
-    setPosition(clamped);
+  const seekTo = useCallback((nextMs: number) => {
+    const clamped = Math.max(0, Math.min(mediaDurationRef.current, nextMs));
+    syncPlaybackPosition(clamped);
     if (audioRef.current && mediaSourceUrl) {
       audioRef.current.currentTime = clamped / 1000;
     }
-  }
+  }, [mediaSourceUrl, syncPlaybackPosition]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -532,7 +681,7 @@ export function TranscriptView({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [allowSimulatedPlayback, mediaSourceUrl, mediaDuration]);
+  }, [togglePlayback]);
 
   const searchCount = useMemo(
     () =>
@@ -558,7 +707,7 @@ export function TranscriptView({
             if (Number.isFinite(durationMs)) setMediaDuration(durationMs);
           }}
           onTimeUpdate={(event) =>
-            setPosition(event.currentTarget.currentTime * 1000)
+            syncPlaybackPosition(event.currentTarget.currentTime * 1000)
           }
           onPlay={() => setPlaying(true)}
           onPause={() => setPlaying(false)}
@@ -698,7 +847,7 @@ export function TranscriptView({
           type="button"
           aria-label="Skip back 10 seconds"
           disabled={!allowSimulatedPlayback && !mediaSourceUrl}
-          onClick={() => seekTo(position - 10_000)}
+          onClick={() => seekTo(playbackPositionRef.current - 10_000)}
         >
           <SkipBack size={20} fill="currentColor" />
         </button>
@@ -720,15 +869,16 @@ export function TranscriptView({
           type="button"
           aria-label="Skip forward 10 seconds"
           disabled={!allowSimulatedPlayback && !mediaSourceUrl}
-          onClick={() => seekTo(position + 10_000)}
+          onClick={() => seekTo(playbackPositionRef.current + 10_000)}
         >
           <SkipForward size={20} fill="currentColor" />
         </button>
-        <span className="player__time">
-          {formatDuration(position)} / {formatDuration(mediaDuration)}
+        <span ref={playbackTimeRef} className="player__time">
+          {formatDuration(initialPositionMs)} / {formatDuration(mediaDuration)}
         </span>
         <Waveform
-          progress={mediaDuration ? position / mediaDuration : 0}
+          ref={waveformRef}
+          progress={mediaDuration ? initialPositionMs / mediaDuration : 0}
           onSeek={(progress) => seekTo(progress * mediaDuration)}
         />
         <button
@@ -813,15 +963,16 @@ export function TranscriptView({
           aria-label="Transcript"
           ref={transcriptScrollRef}
         >
-          <TranscriptRows
+          <PlaybackTranscriptRows
+            ref={playbackRowsRef}
             turns={turns}
             speakers={speakers}
             search={search}
-            editable
             selectedTurnId={selectedTurn}
-            activeTurnId={activeTurnId}
-            activeWordId={activeWordId}
-            playbackPositionMs={position}
+            autoScroll={autoScroll}
+            initialPositionMs={initialPositionMs}
+            playing={playing}
+            scrollRef={transcriptScrollRef}
             onSelectTurn={(turnId) => {
               setSelectedTurn(turnId);
               const turn = turns.find((candidate) => candidate.id === turnId);

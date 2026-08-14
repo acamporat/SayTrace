@@ -10,5 +10,13 @@ Key runtime components include:
 - `faster-whisper-large-v3` and `distil-large-v3.5-ct2` under the licenses declared by their pinned model repositories.
 - `facebook/wav2vec2-base-960h` under Apache-2.0.
 - `pyannote/speaker-diarization-community-1` and `pyannote/wespeaker-voxceleb-resnet34-LM` under CC-BY-4.0, subject to the model repositories' access conditions.
+- On Apple Silicon macOS, Apple MLX and MLX Whisper provide local inference;
+  the pinned quantized Whisper model repositories are declared in
+  `worker/model-manifest.macos.json` and remain subject to their own notices and
+  license terms.
 
-The authoritative repository/revision/license list is `worker/model-manifest.json`. A production release process must generate a complete notice bundle from the resolved Node, Cargo, Python, FFmpeg, and model locks rather than treating this summary as exhaustive.
+The authoritative repository/revision/license lists are
+`worker/model-manifest.json` and `worker/model-manifest.macos.json`. A production
+release process must generate a complete notice bundle from the resolved Node,
+Cargo, Python, FFmpeg, and model locks rather than treating this summary as
+exhaustive.

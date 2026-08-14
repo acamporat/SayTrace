@@ -1,7 +1,8 @@
 """Lazy real ML/media backends.
 
-Importing this module never imports torch, CUDA, faster-whisper, WhisperX, pyannote,
-or NumPy. This keeps health checks and protocol tests useful on clean machines.
+Importing this module never imports MLX, torch, CUDA, faster-whisper, WhisperX,
+pyannote, or NumPy. This keeps health checks and protocol tests useful on clean
+machines.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -63,7 +65,16 @@ class Embedder(Protocol):
 
 
 FallbackCallback = Callable[[str, WorkerError], None]
+ModelLoadCallback = Callable[[str, int], None]
 _WHISPERX_SENTENCE_TOKENIZER_LOCK = threading.Lock()
+_MLX_WHISPER_LOCK = threading.RLock()
+
+
+def _accelerator_retryable(error: WorkerError) -> bool:
+    return error.code in {
+        ErrorCode.ACCELERATOR_UNAVAILABLE,
+        ErrorCode.GPU_OUT_OF_MEMORY,
+    }
 
 
 def _cancelled(cancel: threading.Event) -> None:
@@ -74,10 +85,18 @@ def _cancelled(cancel: threading.Event) -> None:
 def _release_cuda_cache() -> None:
     gc.collect()
     try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except (ImportError, RuntimeError):
+        pass
+    try:
         import torch
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if hasattr(torch, "mps"):
+            torch.mps.empty_cache()
     except (ImportError, RuntimeError):
         pass
 
@@ -93,10 +112,20 @@ def release_backend(backend: object | None) -> None:
             release()
         except Exception:
             # Cleanup is best effort. The process remains recoverable and the next
-            # backend load still starts by asking PyTorch to empty its CUDA cache.
+            # backend load still starts by clearing the available accelerator cache.
             _release_cuda_cache()
     else:
         _release_cuda_cache()
+
+
+def _report_model_load(callback: ModelLoadCallback | None, component: str, started: float) -> None:
+    if callback is None:
+        return
+    try:
+        callback(component, max(0, round((time.monotonic() - started) * 1000)))
+    except Exception:
+        # Observability must never change an inference result.
+        pass
 
 
 class FfmpegNormalizer:
@@ -127,7 +156,7 @@ class FfmpegNormalizer:
             "pcm_s16le",
             str(partial),
         ]
-        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -163,6 +192,8 @@ class FasterWhisperBackend:
         beam_size: int = 5,
         vad_filter: bool = True,
         batch_size: int = 1,
+        on_model_load: ModelLoadCallback | None = None,
+        component: str = "final_asr",
     ) -> None:
         self.model_path = model_path
         self.device = device
@@ -170,6 +201,8 @@ class FasterWhisperBackend:
         self.beam_size = beam_size
         self.vad_filter = vad_filter
         self.batch_size = batch_size
+        self.on_model_load = on_model_load
+        self.component = component
         self._model: Any = None
         self._load_lock = threading.Lock()
 
@@ -178,6 +211,7 @@ class FasterWhisperBackend:
             return self._model
         with self._load_lock:
             if self._model is None:
+                started = time.monotonic()
                 try:
                     from faster_whisper import BatchedInferencePipeline, WhisperModel
                 except ImportError as exc:
@@ -196,7 +230,11 @@ class FasterWhisperBackend:
                     raise _translate_ml_error(
                         exc, "Unable to load the local Whisper model."
                     ) from exc
+                _report_model_load(self.on_model_load, self.component, started)
         return self._model
+
+    def prewarm(self) -> None:
+        self._load()
 
     def transcribe(
         self, audio_path: Path, source_id: str, cancel: threading.Event
@@ -284,8 +322,218 @@ class FasterWhisperBackend:
         _release_cuda_cache()
 
 
+class MlxWhisperBackend:
+    """Apple Silicon Whisper inference using MLX and local converted weights."""
+
+    def __init__(
+        self,
+        model_path: Path,
+        *,
+        beam_size: int = 5,
+        condition_on_previous_text: bool = True,
+        word_timestamps: bool = True,
+        on_model_load: ModelLoadCallback | None = None,
+        component: str = "final_asr",
+    ) -> None:
+        self.model_path = model_path
+        self.beam_size = beam_size
+        self.condition_on_previous_text = condition_on_previous_text
+        self.word_timestamps = word_timestamps
+        self.on_model_load = on_model_load
+        self.component = component
+
+    def _load_locked(self) -> None:
+        try:
+            import mlx.core as mx
+        except ImportError as exc:
+            raise missing_dependency("mlx", "Apple Silicon transcription") from exc
+        try:
+            module = importlib.import_module("mlx_whisper.transcribe")
+            holder = module.ModelHolder
+            cold = holder.model is None or holder.model_path != str(self.model_path)
+            if not cold:
+                return
+            started = time.monotonic()
+            holder.get_model(str(self.model_path), mx.float16)
+            _report_model_load(self.on_model_load, self.component, started)
+        except WorkerError:
+            raise
+        except Exception as exc:
+            raise _translate_ml_error(exc, "Unable to load the local MLX Whisper model.") from exc
+
+    def prewarm(self) -> None:
+        with _MLX_WHISPER_LOCK:
+            self._load_locked()
+
+    def transcribe(
+        self, audio_path: Path, source_id: str, cancel: threading.Event
+    ) -> list[WordTiming]:
+        _cancelled(cancel)
+        try:
+            try:
+                import mlx_whisper
+            except ImportError as exc:
+                raise missing_dependency("mlx-whisper", "Apple Silicon transcription") from exc
+
+            # mlx-whisper owns one process-wide model cache. Serialize calls so a
+            # live-model release cannot race a final-model load.
+            audio = _read_mlx_waveform(audio_path)
+            with _MLX_WHISPER_LOCK:
+                self._load_locked()
+                result = mlx_whisper.transcribe(
+                    audio,
+                    path_or_hf_repo=str(self.model_path),
+                    language="en",
+                    task="transcribe",
+                    word_timestamps=self.word_timestamps,
+                    # mlx-whisper 0.4.x exposes beam_size but its decoder raises
+                    # NotImplementedError. Greedy decode runs at temperature 0;
+                    # best_of controls the supported sampled fallback passes.
+                    best_of=max(1, self.beam_size),
+                    temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+                    condition_on_previous_text=self.condition_on_previous_text,
+                    hallucination_silence_threshold=2.0,
+                    verbose=None,
+                )
+            _cancelled(cancel)
+            return _mlx_result_words(result, source_id, cancel)
+        except WorkerError:
+            raise
+        except Exception as exc:
+            raise _translate_ml_error(exc, "MLX Whisper transcription failed.") from exc
+
+    def transcribe_pcm(self, pcm: bytes, sample_rate: int, channels: int) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            temp_path = Path(handle.name)
+        try:
+            with wave.open(str(temp_path), "wb") as output:
+                output.setnchannels(channels)
+                output.setsampwidth(2)
+                output.setframerate(sample_rate)
+                output.writeframes(pcm)
+            words = self.transcribe(temp_path, "live", threading.Event())
+            return join_tokens([word.text for word in words])
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def release(self) -> None:
+        # MLX Whisper's holder is process-global. Only the backend whose path is
+        # still resident may clear it; a stale final-cache eviction must never
+        # discard a live model that replaced it (or vice versa).
+        with _MLX_WHISPER_LOCK:
+            try:
+                module = importlib.import_module("mlx_whisper.transcribe")
+                holder = getattr(module, "ModelHolder", None)
+                if holder is not None and holder.model_path == str(self.model_path):
+                    holder.model = None
+                    holder.model_path = None
+            except (ImportError, AttributeError):
+                pass
+        _release_cuda_cache()
+
+
+def _read_mlx_waveform(audio_path: Path) -> Any:
+    """Load PCM for MLX directly so inference never discovers FFmpeg via PATH."""
+
+    try:
+        import numpy as np
+        from scipy.signal import resample_poly
+    except ImportError as exc:
+        raise missing_dependency("numpy/scipy", "Apple Silicon audio loading") from exc
+
+    try:
+        with wave.open(str(audio_path), "rb") as handle:
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+            sample_rate = handle.getframerate()
+            frame_count = handle.getnframes()
+            if channels < 1 or sample_width != 2 or sample_rate < 1:
+                raise ValueError("expected PCM s16le audio")
+            pcm = handle.readframes(frame_count)
+    except (OSError, EOFError, wave.Error, ValueError) as exc:
+        raise WorkerError(
+            ErrorCode.UNSUPPORTED_AUDIO,
+            "Normalized audio could not be loaded for MLX transcription.",
+            {"path": str(audio_path)},
+        ) from exc
+
+    values = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+    if channels > 1:
+        values = values.reshape(-1, channels).mean(axis=1)
+    values = values / 32768.0
+    if sample_rate != 16_000:
+        divisor = math.gcd(sample_rate, 16_000)
+        values = resample_poly(values, 16_000 // divisor, sample_rate // divisor).astype(
+            np.float32, copy=False
+        )
+    return values
+
+
+def _mlx_result_words(result: Any, source_id: str, cancel: threading.Event) -> list[WordTiming]:
+    output: list[WordTiming] = []
+    sequence = 0
+    for segment in result.get("segments", []):
+        _cancelled(cancel)
+        raw_words = segment.get("words") or []
+        if raw_words:
+            for word in raw_words:
+                text = str(word.get("word", "")).strip()
+                if not text:
+                    continue
+                output.append(
+                    WordTiming(
+                        word_id=f"{source_id}:{sequence}",
+                        text=text,
+                        model_text=text,
+                        start_ms=max(0, round(float(word["start"]) * 1000)),
+                        end_ms=max(0, round(float(word["end"]) * 1000)),
+                        source_id=source_id,
+                        confidence=(
+                            float(word["probability"])
+                            if word.get("probability") is not None
+                            else None
+                        ),
+                    )
+                )
+                sequence += 1
+            continue
+
+        tokens = str(segment.get("text", "")).strip().split()
+        start_ms = max(0, round(float(segment.get("start", 0.0)) * 1000))
+        end_ms = max(start_ms + 1, round(float(segment.get("end", 0.0)) * 1000))
+        step = max(1, (end_ms - start_ms) // max(1, len(tokens)))
+        for index, token in enumerate(tokens):
+            output.append(
+                WordTiming(
+                    word_id=f"{source_id}:{sequence}",
+                    text=token,
+                    model_text=token,
+                    start_ms=start_ms + index * step,
+                    end_ms=end_ms if index == len(tokens) - 1 else start_ms + (index + 1) * step,
+                    source_id=source_id,
+                )
+            )
+            sequence += 1
+    return output
+
+
+class NativeWordTimestampAligner:
+    """Accept ASR-native timestamps as the canonical alignment result."""
+
+    def align(
+        self,
+        audio_path: Path,
+        source_id: str,
+        words: Sequence[WordTiming],
+        cancel: threading.Event,
+    ) -> list[WordTiming]:
+        del audio_path, source_id
+        _cancelled(cancel)
+        return list(words)
+
+
 class RetryingTranscriber:
-    """Try CUDA FP16, CUDA int8_float16, then CPU int8 only on OOM."""
+    """Try progressively safer backends after a retryable accelerator failure."""
 
     def __init__(self, attempts: Sequence[Transcriber]) -> None:
         if not attempts:
@@ -300,7 +548,7 @@ class RetryingTranscriber:
             try:
                 return backend.transcribe(audio_path, source_id, cancel)
             except WorkerError as exc:
-                if exc.code is not ErrorCode.GPU_OUT_OF_MEMORY:
+                if not _accelerator_retryable(exc):
                     raise
                 release_backend(backend)
                 last_error = exc
@@ -314,12 +562,19 @@ class RetryingTranscriber:
 
 
 class WhisperXAligner:
-    def __init__(self, model_path: Path, *, device: str) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        *,
+        device: str,
+        on_model_load: ModelLoadCallback | None = None,
+    ) -> None:
         self.model_path = model_path
         self.device = device
         self._model: Any = None
         self._metadata: Any = None
         self._load_lock = threading.Lock()
+        self.on_model_load = on_model_load
 
     def _load(self) -> tuple[Any, Any, Any]:
         try:
@@ -329,6 +584,7 @@ class WhisperXAligner:
         if self._model is None:
             with self._load_lock:
                 if self._model is None:
+                    started = time.monotonic()
                     self._model, self._metadata = whisperx.load_align_model(
                         language_code="en",
                         device=self.device,
@@ -336,7 +592,11 @@ class WhisperXAligner:
                         model_dir=str(self.model_path.parent),
                         model_cache_only=True,
                     )
+                    _report_model_load(self.on_model_load, "alignment", started)
         return whisperx, self._model, self._metadata
+
+    def prewarm(self) -> None:
+        self._load()
 
     def align(
         self,
@@ -394,7 +654,7 @@ class WhisperXAligner:
 
 
 class RetryingAligner:
-    """Retry WhisperX on CPU only when the CUDA attempt exhausts device memory."""
+    """Retry alignment on CPU after a retryable accelerator failure."""
 
     def __init__(
         self,
@@ -419,7 +679,7 @@ class RetryingAligner:
             try:
                 return backend.align(audio_path, source_id, words, cancel)
             except WorkerError as exc:
-                if exc.code is not ErrorCode.GPU_OUT_OF_MEMORY:
+                if not _accelerator_retryable(exc):
                     raise
                 release_backend(backend)
                 last_error = exc
@@ -493,17 +753,25 @@ def _load_offline_sentence_tokenizer(
 
 
 class PyannoteDiarizer:
-    def __init__(self, model_path: Path, *, device: str) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        *,
+        device: str,
+        on_model_load: ModelLoadCallback | None = None,
+    ) -> None:
         self.model_path = model_path
         self.device = device
         self._pipeline: Any = None
         self._load_lock = threading.Lock()
+        self.on_model_load = on_model_load
 
     def _load(self) -> Any:
         if self._pipeline is not None:
             return self._pipeline
         with self._load_lock:
             if self._pipeline is None:
+                started = time.monotonic()
                 try:
                     import torch
                     from pyannote.audio import Pipeline
@@ -511,11 +779,15 @@ class PyannoteDiarizer:
                     raise missing_dependency("pyannote.audio", "speaker diarization") from exc
                 try:
                     self._pipeline = Pipeline.from_pretrained(str(self.model_path))
-                    if self.device == "cuda":
-                        self._pipeline.to(torch.device("cuda"))
+                    if self.device != "cpu":
+                        self._pipeline.to(torch.device(self.device))
                 except Exception as exc:
                     raise _translate_ml_error(exc, "Unable to load Community-1.") from exc
+                _report_model_load(self.on_model_load, "diarization", started)
         return self._pipeline
+
+    def prewarm(self) -> None:
+        self._load()
 
     def diarize(self, audio_path: Path, cancel: threading.Event) -> list[DiarizationSegment]:
         _cancelled(cancel)
@@ -551,7 +823,7 @@ class PyannoteDiarizer:
 
 
 class RetryingDiarizer:
-    """Retry Community-1 on CPU only after a CUDA out-of-memory failure."""
+    """Retry Community-1 on CPU after a retryable accelerator failure."""
 
     def __init__(
         self,
@@ -570,7 +842,7 @@ class RetryingDiarizer:
             try:
                 return backend.diarize(audio_path, cancel)
             except WorkerError as exc:
-                if exc.code is not ErrorCode.GPU_OUT_OF_MEMORY:
+                if not _accelerator_retryable(exc):
                     raise
                 release_backend(backend)
                 last_error = exc
@@ -613,18 +885,26 @@ def _overlap_intervals(annotation: Any) -> list[tuple[int, int]]:
 
 
 class WeSpeakerEmbedder:
-    def __init__(self, model_path: Path, *, device: str) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        *,
+        device: str,
+        on_model_load: ModelLoadCallback | None = None,
+    ) -> None:
         self.model_path = model_path
         self.device = device
         self._inference: Any = None
         self._segment_type: Any = None
         self._load_lock = threading.Lock()
+        self.on_model_load = on_model_load
 
     def _load(self) -> tuple[Any, Any]:
         if self._inference is not None:
             return self._inference, self._segment_type
         with self._load_lock:
             if self._inference is None:
+                started = time.monotonic()
                 try:
                     import torch
                     from pyannote.audio import Inference, Model
@@ -632,11 +912,20 @@ class WeSpeakerEmbedder:
                 except ImportError as exc:
                     raise missing_dependency("pyannote.audio", "speaker embeddings") from exc
                 model = Model.from_pretrained(str(self.model_path))
-                if self.device == "cuda":
-                    model.to(torch.device("cuda"))  # type: ignore[union-attr]
-                self._inference = Inference(model, window="whole")  # type: ignore[arg-type]
+                if model is None:
+                    raise WorkerError(
+                        ErrorCode.MODEL_MISSING,
+                        "The local speaker embedding model could not be loaded.",
+                    )
+                if self.device != "cpu":
+                    model.to(torch.device(self.device))
+                self._inference = Inference(model, window="whole")
                 self._segment_type = Segment
+                _report_model_load(self.on_model_load, "speaker_embedding", started)
         return self._inference, self._segment_type
+
+    def prewarm(self) -> None:
+        self._load()
 
     def embed_intervals(
         self,
@@ -724,7 +1013,7 @@ def _pyannote_waveform(audio_path: Path) -> dict[str, Any]:
 
 
 class RetryingEmbedder:
-    """Retry speaker embedding extraction on CPU after CUDA OOM."""
+    """Retry speaker embedding extraction on CPU after an accelerator failure."""
 
     def __init__(
         self,
@@ -748,7 +1037,7 @@ class RetryingEmbedder:
             try:
                 return backend.embed_intervals(audio_path, intervals_ms, cancel)
             except WorkerError as exc:
-                if exc.code is not ErrorCode.GPU_OUT_OF_MEMORY:
+                if not _accelerator_retryable(exc):
                     raise
                 release_backend(backend)
                 last_error = exc
@@ -831,9 +1120,32 @@ def _read_wave_window(path: Path, start_ms: int, end_ms: int, np: Any) -> tuple[
 
 def _translate_ml_error(exc: Exception, message: str) -> WorkerError:
     text = str(exc).casefold()
-    if "out of memory" in text or "cuda_error_out_of_memory" in text:
+    if any(
+        marker in text
+        for marker in (
+            "out of memory",
+            "cuda_error_out_of_memory",
+            "failed to allocate",
+            "resource limit",
+        )
+    ):
         return WorkerError(
             ErrorCode.GPU_OUT_OF_MEMORY,
+            message,
+            {"exception": type(exc).__name__},
+            retryable=True,
+        )
+    if any(
+        marker in text
+        for marker in (
+            "mps backend",
+            "not implemented for mps",
+            "not supported on mps",
+            "metal command buffer",
+        )
+    ):
+        return WorkerError(
+            ErrorCode.ACCELERATOR_UNAVAILABLE,
             message,
             {"exception": type(exc).__name__},
             retryable=True,

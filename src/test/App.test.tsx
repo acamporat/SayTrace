@@ -151,12 +151,18 @@ describe("SayTrace workspace", () => {
     expect(
       screen.getByRole("heading", { name: "Voice profiles" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText("Protected with your macOS Keychain"),
+    ).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Settings" }));
     expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(
       screen.getByText("Local transcription models installed"),
     ).toBeInTheDocument();
+    expect(screen.getByText("Apple Silicon acceleration")).toBeInTheDocument();
+    expect(screen.getByText(/Library\/Application Support/)).toBeInTheDocument();
+    expect(screen.getByText(/turn on FileVault/i)).toBeInTheDocument();
   });
 
   it("explicitly confirms a clean local speaker sample without renderer embeddings", async () => {
@@ -285,6 +291,34 @@ describe("SayTrace workspace", () => {
 });
 
 describe("Model setup", () => {
+  it("shows runtime verification without a false repair warning", () => {
+    render(
+      <ModelSetupView
+        status={{
+          runtime: "checking",
+          liveModel: "missing",
+          finalModel: "missing",
+          diarizationModel: "missing",
+          device: "Apple MLX (Metal)",
+          diskRequiredGb: 2,
+          diskAvailableGb: 100,
+        }}
+        onBack={() => undefined}
+        onInstall={async () => undefined}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "Verifying local runtime…" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "This installation needs repair" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Hugging Face access token"),
+    ).not.toBeInTheDocument();
+  });
+
   it("explains that a missing bundled runtime is repaired by reinstalling the app", () => {
     render(
       <ModelSetupView
@@ -308,7 +342,7 @@ describe("Model setup", () => {
       }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/included automatically with the Windows installer/i),
+      screen.getByText(/included automatically with the macOS app/i),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/do not need to find or install a separate runtime pack/i),
@@ -332,7 +366,7 @@ describe("Model setup", () => {
           liveModel: "missing",
           finalModel: "missing",
           diarizationModel: "missing",
-          device: "NVIDIA RTX 2080 Ti",
+          device: "Apple MLX (Metal)",
           diskRequiredGb: 12,
           diskAvailableGb: 100,
         }}
@@ -389,6 +423,64 @@ describe("Model setup", () => {
     expect(screen.getByText("Overall setup · model 4 of 5")).toBeInTheDocument();
   });
 
+  it("omits the alignment step and reaches 100% for Apple MLX setup", () => {
+    render(
+      <ModelSetupView
+        status={{
+          runtime: "ready",
+          liveModel: "missing",
+          finalModel: "missing",
+          diarizationModel: "missing",
+          device: "Apple MLX (Metal)",
+          diskRequiredGb: 2,
+          diskAvailableGb: 100,
+        }}
+        progress={{
+          request_id: "request-mlx-4",
+          key: "speaker_embedding",
+          code: "MODEL_SETUP_PROGRESS",
+          phase: "complete",
+          completed_steps: 4,
+          total_steps: 4,
+        }}
+        onBack={() => undefined}
+        onInstall={async () => undefined}
+      />,
+    );
+
+    expect(screen.getByText("Voice matching")).toBeInTheDocument();
+    expect(screen.getByText("Overall setup · model 4 of 4")).toBeInTheDocument();
+    expect(
+      screen.getByRole("progressbar", {
+        name: "Overall model setup progress",
+      }),
+    ).toHaveAttribute("value", "100");
+  });
+
+  it("describes the installed Apple MLX model set accurately", () => {
+    render(
+      <ModelSetupView
+        status={{
+          runtime: "ready",
+          liveModel: "ready",
+          finalModel: "ready",
+          diarizationModel: "ready",
+          device: "Apple MLX (Metal)",
+          diskRequiredGb: 2,
+          diskAvailableGb: 100,
+        }}
+        onBack={() => undefined}
+        onInstall={async () => undefined}
+      />,
+    );
+
+    expect(screen.getByText("Whisper Small.en MLX Q4")).toBeInTheDocument();
+    expect(
+      screen.getByText("Whisper Large v3 Turbo MLX Q4"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/alignment/i)).not.toBeInTheDocument();
+  });
+
   it("keeps the token available and shows an alert when setup fails", async () => {
     const user = userEvent.setup();
     render(
@@ -398,7 +490,7 @@ describe("Model setup", () => {
           liveModel: "missing",
           finalModel: "missing",
           diarizationModel: "missing",
-          device: "NVIDIA RTX 2080 Ti",
+          device: "Apple MLX (Metal)",
           diskRequiredGb: 12,
           diskAvailableGb: 100,
         }}
@@ -431,7 +523,7 @@ describe("Model setup", () => {
           liveModel: "missing",
           finalModel: "missing",
           diarizationModel: "missing",
-          device: "NVIDIA RTX 2080 Ti",
+          device: "Apple MLX (Metal)",
           diskRequiredGb: 12,
           diskAvailableGb: 100,
         }}
@@ -457,7 +549,7 @@ describe("Model setup", () => {
           liveModel: "missing",
           finalModel: "missing",
           diarizationModel: "missing",
-          device: "NVIDIA RTX 2080 Ti",
+          device: "Apple MLX (Metal)",
           diskRequiredGb: 12,
           diskAvailableGb: 100,
         }}

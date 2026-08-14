@@ -287,10 +287,16 @@ export interface WorkerHealthEvent {
   backend: string;
 }
 
+export interface StartupChangedEvent {
+  area: "runtime" | "recovery";
+  status: "ready" | "complete" | "failed";
+}
+
 export interface DeviceWarningEvent {
   deviceId: string;
   code:
     | "CAPTURE_FAILED"
+    | "CAPTIONS_UNAVAILABLE"
     | "DEVICE_LOST"
     | "BUFFER_DISCONTINUITY"
     | "LOW_DISK";

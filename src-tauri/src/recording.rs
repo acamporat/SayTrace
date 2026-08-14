@@ -1,11 +1,11 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{self, SyncSender},
         Arc,
     },
@@ -32,12 +32,129 @@ use crate::{
         AudioDeviceList, Meeting, RecordingConfig, RecordingMarker, RecordingSession,
         RecordingState, RecordingStatus,
     },
+    performance::PerformanceSpan,
     service::CoreService,
     worker::{AudioMetadata, WorkerRequest, WorkerSupervisor},
 };
 
 const CAPTION_QUEUE_CHUNKS: usize = 2048;
+const FLAC_COMPRESSION_LEVEL: &str = "2";
+#[cfg(target_os = "macos")]
+const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(target_os = "macos"))]
 const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "macos")]
+const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum RecordingLifecycleState {
+    Idle = 0,
+    Starting = 1,
+    Active = 2,
+    Finalizing = 3,
+}
+
+impl RecordingLifecycleState {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Starting,
+            2 => Self::Active,
+            3 => Self::Finalizing,
+            _ => Self::Idle,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecordingLifecycle {
+    state: AtomicU8,
+}
+
+impl RecordingLifecycle {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(RecordingLifecycleState::Idle as u8),
+        }
+    }
+
+    fn state(&self) -> RecordingLifecycleState {
+        RecordingLifecycleState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    fn begin_start(&self) -> CoreResult<StartingGuard<'_>> {
+        self.state
+            .compare_exchange(
+                RecordingLifecycleState::Idle as u8,
+                RecordingLifecycleState::Starting as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|current| lifecycle_conflict(RecordingLifecycleState::from_raw(current)))?;
+        Ok(StartingGuard {
+            lifecycle: self,
+            activated: false,
+        })
+    }
+
+    fn begin_finalization(&self) -> CoreResult<FinalizingGuard<'_>> {
+        self.state
+            .compare_exchange(
+                RecordingLifecycleState::Active as u8,
+                RecordingLifecycleState::Finalizing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|current| lifecycle_conflict(RecordingLifecycleState::from_raw(current)))?;
+        Ok(FinalizingGuard { lifecycle: self })
+    }
+}
+
+struct StartingGuard<'a> {
+    lifecycle: &'a RecordingLifecycle,
+    activated: bool,
+}
+
+impl StartingGuard<'_> {
+    fn activate(mut self) {
+        self.lifecycle
+            .state
+            .store(RecordingLifecycleState::Active as u8, Ordering::Release);
+        self.activated = true;
+    }
+}
+
+impl Drop for StartingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.activated {
+            self.lifecycle
+                .state
+                .store(RecordingLifecycleState::Idle as u8, Ordering::Release);
+        }
+    }
+}
+
+struct FinalizingGuard<'a> {
+    lifecycle: &'a RecordingLifecycle,
+}
+
+impl Drop for FinalizingGuard<'_> {
+    fn drop(&mut self) {
+        self.lifecycle
+            .state
+            .store(RecordingLifecycleState::Idle as u8, Ordering::Release);
+    }
+}
+
+fn lifecycle_conflict(state: RecordingLifecycleState) -> CoreError {
+    let message = match state {
+        RecordingLifecycleState::Idle => "recording lifecycle changed; try again",
+        RecordingLifecycleState::Starting => "another recording is already starting",
+        RecordingLifecycleState::Active => "another recording is already active",
+        RecordingLifecycleState::Finalizing => "the previous recording is still being finalized",
+    };
+    CoreError::Conflict(message.into())
+}
 
 struct ActiveTrack {
     track_id: String,
@@ -69,6 +186,7 @@ pub struct RecordingManager {
     core: Arc<CoreService>,
     worker: Arc<WorkerSupervisor>,
     active: Arc<Mutex<Option<ActiveRecording>>>,
+    lifecycle: RecordingLifecycle,
 }
 
 impl RecordingManager {
@@ -77,6 +195,7 @@ impl RecordingManager {
             core,
             worker,
             active: Arc::new(Mutex::new(None)),
+            lifecycle: RecordingLifecycle::new(),
         }
     }
 
@@ -85,11 +204,29 @@ impl RecordingManager {
     }
 
     pub fn status(&self) -> RecordingStatus {
+        let lifecycle = self.lifecycle.state();
         let active = self.active.lock();
-        let Some(active) = active.as_ref() else {
-            return RecordingStatus::default();
-        };
-        status_from_active(active)
+        if let Some(active) = active.as_ref() {
+            let mut status = status_from_active(active);
+            status.state = match lifecycle {
+                RecordingLifecycleState::Starting => RecordingState::Starting,
+                RecordingLifecycleState::Finalizing => RecordingState::Finalizing,
+                RecordingLifecycleState::Idle | RecordingLifecycleState::Active => status.state,
+            };
+            return status;
+        }
+        drop(active);
+
+        RecordingStatus {
+            state: match self.lifecycle.state() {
+                RecordingLifecycleState::Starting => RecordingState::Starting,
+                RecordingLifecycleState::Finalizing => RecordingState::Finalizing,
+                RecordingLifecycleState::Idle | RecordingLifecycleState::Active => {
+                    RecordingState::Idle
+                }
+            },
+            ..RecordingStatus::default()
+        }
     }
 
     pub fn start(
@@ -98,11 +235,19 @@ impl RecordingManager {
         config: RecordingConfig,
         app: AppHandle,
     ) -> CoreResult<RecordingSession> {
+        let _start_span = PerformanceSpan::new(
+            "recording_start",
+            format!(
+                "microphone={} system_audio={} live_captions={}",
+                config.capture_microphone, config.capture_system_audio, config.live_captions
+            ),
+        );
         if !config.capture_microphone && !config.capture_system_audio {
             return Err(CoreError::InvalidInput(
                 "select a microphone, system audio, or both".into(),
             ));
         }
+        let starting_guard = self.lifecycle.begin_start()?;
         if self.active.lock().is_some() {
             return Err(CoreError::Conflict(
                 "another recording is already active".into(),
@@ -214,6 +359,7 @@ impl RecordingManager {
         };
         let mut tracks = Vec::new();
         let mut readiness = Vec::new();
+        let mut prepared = Vec::with_capacity(track_specs.len());
         for (track_id, kind, device_id, channels) in track_specs {
             let (command_sender, command_receiver) = mpsc::sync_channel(8);
             let shared = Arc::new(CaptureShared::default());
@@ -228,21 +374,52 @@ impl RecordingManager {
                 session_qpc_start: qpc_start,
                 qpc_frequency,
             };
-            match audio::spawn_capture(
+            prepared.push((
+                ActiveTrack {
+                    track_id,
+                    kind,
+                    command_sender,
+                    handle: None,
+                    shared: shared.clone(),
+                },
                 spec,
                 command_receiver,
-                caption_sender.clone(),
-                shared.clone(),
-            ) {
+                shared,
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut requests = Vec::with_capacity(prepared.len());
+            for (track, spec, commands, shared) in prepared {
+                tracks.push(track);
+                requests.push(audio::MacosCaptureRequest {
+                    spec,
+                    commands,
+                    shared,
+                });
+            }
+            match audio::spawn_macos_captures(requests, caption_sender.clone()) {
+                Ok(launches) => {
+                    for (track, (handle, ready)) in tracks.iter_mut().zip(launches) {
+                        track.handle = Some(handle);
+                        readiness.push(ready);
+                    }
+                }
+                Err(error) => {
+                    self.fail_start(&meeting_id, &session_id, &manifest_path, &error)?;
+                    return Err(error);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        for (mut track, spec, command_receiver, shared) in prepared {
+            match audio::spawn_capture(spec, command_receiver, caption_sender.clone(), shared) {
                 Ok((handle, ready)) => {
                     readiness.push(ready);
-                    tracks.push(ActiveTrack {
-                        track_id,
-                        kind,
-                        command_sender,
-                        handle: Some(handle),
-                        shared,
-                    });
+                    track.handle = Some(handle);
+                    tracks.push(track);
                 }
                 Err(error) => {
                     stop_tracks(&mut tracks);
@@ -261,10 +438,18 @@ impl RecordingManager {
                     self.fail_start(&meeting_id, &session_id, &manifest_path, &error)?;
                     return Err(error);
                 }
-                Err(_) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    #[cfg(target_os = "macos")]
+                    audio::poison_macos_capture_lifecycle();
+                    cancel_starting_tracks(&mut tracks);
+                    let error = CoreError::Audio(capture_ready_timeout_message().into());
+                    self.fail_start(&meeting_id, &session_id, &manifest_path, &error)?;
+                    return Err(error);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     stop_tracks(&mut tracks);
                     let error = CoreError::Audio(
-                        "audio device did not become ready within eight seconds".into(),
+                        "audio capture ended before the device became ready".into(),
                     );
                     self.fail_start(&meeting_id, &session_id, &manifest_path, &error)?;
                     return Err(error);
@@ -323,6 +508,7 @@ impl RecordingManager {
             qpc_frequency,
         };
         *self.active.lock() = Some(active);
+        starting_guard.activate();
         let connection = self.core.database().connect()?;
         connection.execute(
             "UPDATE recording_sessions SET state='recording' WHERE id=?1",
@@ -330,6 +516,19 @@ impl RecordingManager {
         )?;
         let session = self.session()?;
         let _ = app.emit("recording://state", &session);
+        if !config.live_captions {
+            let worker = self.worker.clone();
+            if let Err(error) = thread::Builder::new()
+                .name("saytrace-model-prewarm".into())
+                .spawn(move || {
+                    if let Err(error) = worker.prewarm_performance() {
+                        log::warn!("model prewarm was skipped: {error}");
+                    }
+                })
+            {
+                log::warn!("could not start model prewarm task: {error}");
+            }
+        }
         Ok(session)
     }
 
@@ -523,7 +722,7 @@ impl RecordingManager {
     }
 
     pub fn stop(&self, session_id: &str, app: AppHandle) -> CoreResult<Meeting> {
-        let mut recording = {
+        let (mut recording, _finalizing_guard) = {
             let mut active = self.active.lock();
             let current = active
                 .as_ref()
@@ -533,10 +732,15 @@ impl RecordingManager {
                     "recording session id does not match the active session".into(),
                 ));
             }
+            let finalizing_guard = self.lifecycle.begin_finalization()?;
             let mut recording = active.take().unwrap();
             recording.state = RecordingState::Finalizing;
-            recording
+            (recording, finalizing_guard)
         };
+        let _finalization_span = PerformanceSpan::new(
+            "recording_finalization",
+            format!("track_count={}", recording.tracks.len()),
+        );
         let finalizing = RecordingSession {
             id: recording.id.clone(),
             meeting_id: recording.meeting_id.clone(),
@@ -545,6 +749,10 @@ impl RecordingManager {
             started_at: iso_from_ms(recording.started_at_ms),
         };
         let _ = app.emit("recording://state", &finalizing);
+        let capture_stop_span = PerformanceSpan::new(
+            "recording_capture_stop",
+            format!("track_count={}", recording.tracks.len()),
+        );
         recording.monitor_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = recording.monitor_handle.take() {
             let _ = handle.join();
@@ -569,8 +777,30 @@ impl RecordingManager {
             }
         }
         let mut summaries = Vec::new();
+        #[cfg(target_os = "macos")]
+        let capture_stop_deadline = Instant::now() + CAPTURE_STOP_TIMEOUT;
         for track in &mut recording.tracks {
             if let Some(handle) = track.handle.take() {
+                #[cfg(target_os = "macos")]
+                if !wait_for_capture_handle(&handle, capture_stop_deadline) {
+                    audio::poison_macos_capture_lifecycle();
+                    let message = format!(
+                        "{} capture did not stop within 15 seconds; SayTrace must be restarted before recording again",
+                        track.kind.as_str()
+                    );
+                    track.shared.mark_failed(message.clone());
+                    persist_capture_warning(
+                        &self.core,
+                        &app,
+                        &recording.id,
+                        &recording.manifest_path,
+                        track.kind.as_str(),
+                        &message,
+                    );
+                    errors.push(message);
+                    drop(handle);
+                    continue;
+                }
                 match handle.join() {
                     Ok(Ok(summary)) => summaries.push((track.track_id.clone(), summary)),
                     Ok(Err(error)) => {
@@ -600,16 +830,17 @@ impl RecordingManager {
                 }
             }
         }
+        drop(capture_stop_span);
         // The caption queue is disposable; never let a stalled model worker block finalization.
         let _ = recording.caption_handle.take();
         let ended_at_ms = now_ms();
-        let mut assets = Vec::new();
-        for (track_id, summary) in &summaries {
+        let mut consolidation_inputs = Vec::with_capacity(summaries.len());
+        for (track_id, summary) in summaries {
             if summary.segment_paths.is_empty() {
                 continue;
             }
             let clock_plan =
-                build_clock_plan(summary, recording.qpc_start, recording.qpc_frequency);
+                build_clock_plan(&summary, recording.qpc_start, recording.qpc_frequency);
             if clock_plan.unrepaired_discontinuities > 0 {
                 errors.push(format!(
                     "{} contains {} discontinuities without a measurable clock gap",
@@ -617,17 +848,53 @@ impl RecordingManager {
                     clock_plan.unrepaired_discontinuities
                 ));
             }
-            match consolidate_track(
-                self.core.layout(),
-                &recording.meeting_id,
-                &recording.id,
-                summary,
-                &clock_plan,
-            ) {
-                Ok(asset) => assets.push((track_id.clone(), summary, clock_plan, asset)),
-                Err(error) => errors.push(error.to_string()),
+            consolidation_inputs.push((track_id, summary, clock_plan));
+        }
+
+        let track_span = PerformanceSpan::new(
+            "recording_track_consolidation",
+            format!("track_count={}", consolidation_inputs.len()),
+        );
+        let layout = self.core.layout();
+        let meeting_id = recording.meeting_id.as_str();
+        let recording_id = recording.id.as_str();
+        let consolidation_results = thread::scope(|scope| {
+            let handles = consolidation_inputs
+                .into_iter()
+                .map(|(track_id, summary, clock_plan)| {
+                    scope.spawn(move || {
+                        let result = consolidate_track(
+                            layout,
+                            meeting_id,
+                            recording_id,
+                            &summary,
+                            &clock_plan,
+                        );
+                        (track_id, summary, clock_plan, result)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join())
+                .collect::<Vec<_>>()
+        });
+        drop(track_span);
+
+        let mut assets = Vec::new();
+        for result in consolidation_results {
+            match result {
+                Ok((track_id, summary, clock_plan, Ok(asset))) => {
+                    assets.push((track_id, summary, clock_plan, asset));
+                }
+                Ok((_, _, _, Err(error))) => errors.push(error.to_string()),
+                Err(_) => errors.push("recording track finalization thread panicked".into()),
             }
         }
+        let playback_span = PerformanceSpan::new(
+            "recording_playback_mix",
+            format!("enabled={}", assets.len() == 2),
+        );
         let playback = if assets.len() == 2 {
             match mix_tracks(
                 self.core.layout(),
@@ -645,6 +912,7 @@ impl RecordingManager {
         } else {
             None
         };
+        drop(playback_span);
         let duration_ms = assets
             .iter()
             .filter_map(|(_, _, _, asset)| asset.duration_ms)
@@ -652,6 +920,8 @@ impl RecordingManager {
             .unwrap_or(0);
 
         {
+            let _database_span =
+                PerformanceSpan::new("recording_database_commit", "operation=finalize");
             let mut connection = self.core.database().connect()?;
             let transaction = connection.transaction()?;
             for (track_id, summary, clock_plan, asset) in &assets {
@@ -709,6 +979,7 @@ impl RecordingManager {
             )?;
             transaction.commit()?;
         }
+        self.core.invalidate_library_size_cache();
         append_manifest(
             &recording.manifest_path,
             json!({
@@ -877,6 +1148,43 @@ fn stop_tracks(tracks: &mut [ActiveTrack]) {
             let _ = handle.join();
         }
     }
+}
+
+/// Requests cancellation without joining a native start operation that may be
+/// blocked inside a platform framework. Dropping a JoinHandle detaches it; the
+/// capture thread retains its own state and performs controlled cleanup if the
+/// framework eventually completes the start request.
+fn cancel_starting_tracks(tracks: &mut [ActiveTrack]) {
+    for track in tracks.iter() {
+        let _ = track.command_sender.try_send(CaptureCommand::Stop);
+    }
+    for track in tracks.iter_mut() {
+        let _ = track.handle.take();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_capture_handle(
+    handle: &thread::JoinHandle<CoreResult<CaptureSummary>>,
+    deadline: Instant,
+) -> bool {
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn capture_ready_timeout_message() -> &'static str {
+    "ScreenCaptureKit did not finish starting within 30 seconds; capture was cancelled, and SayTrace must be restarted before retrying"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_ready_timeout_message() -> &'static str {
+    "audio device did not become ready within eight seconds"
 }
 
 fn ensure_capture_healthy(recording: &ActiveRecording) -> CoreResult<()> {
@@ -1067,7 +1375,7 @@ fn spawn_monitor(
                     );
                     terminal_failure_persisted = true;
                 }
-                if ticks % 50 == 0 {
+                if ticks.is_multiple_of(50) {
                     let track_checkpoints = tracks
                         .iter()
                         .enumerate()
@@ -1124,25 +1432,47 @@ fn spawn_caption_relay(
     thread::Builder::new()
         .name("live-caption-relay".into())
         .spawn(move || {
-            let started = worker
-                .request(WorkerRequest::new(
+            let started = match worker.request(WorkerRequest::new(
                     "live.start",
                     json!({
                         "session_id":session_id,
                         "streams":streams
                     }),
-                ))
-                .is_ok();
-            let _ = app.emit(
-                "worker://health",
-                json!({
-                    "status":if started {"ready"} else {"offline"},
-                    "backend":"local"
-                }),
-            );
+                )) {
+                Ok(_) => {
+                    let _ = app.emit(
+                        "worker://health",
+                        json!({"status":"ready","backend":"local"}),
+                    );
+                    true
+                }
+                Err(error) => {
+                    // A final job or model prewarm can legitimately own MLX.
+                    // Capture remains lossless, so report only captions as
+                    // unavailable and preserve the worker's actual health.
+                    let worker_status = worker.status();
+                    let policy = caption_start_failure_policy(&worker_status.state, &error);
+                    let _ = app.emit(
+                        "worker://health",
+                        json!({"status":policy.worker_health,"backend":"local"}),
+                    );
+                    let _ = app.emit(
+                        "device://warning",
+                        json!({
+                            "deviceId":"captions",
+                            "code":"CAPTIONS_UNAVAILABLE",
+                            "message":policy.message
+                        }),
+                    );
+                    false
+                }
+            };
+            if !started {
+                return;
+            }
             loop {
                 match receiver.recv_timeout(Duration::from_millis(50)) {
-                    Ok(chunk) if started => {
+                    Ok(chunk) => {
                         let metadata = AudioMetadata {
                             session_id: chunk.session_id,
                             stream_id: chunk.stream_id,
@@ -1162,7 +1492,6 @@ fn spawn_caption_relay(
                             break;
                         }
                     }
-                    Ok(_) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
@@ -1185,6 +1514,34 @@ fn spawn_caption_relay(
             ));
         })
         .expect("caption relay thread creation failed")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CaptionStartFailurePolicy {
+    worker_health: &'static str,
+    message: &'static str,
+}
+
+fn caption_start_failure_policy(
+    worker_state: &str,
+    error: &CoreError,
+) -> CaptionStartFailurePolicy {
+    let worker_health = match worker_state {
+        "ready" => "ready",
+        "busy" => "busy",
+        "recovering" => "recovering",
+        _ => "offline",
+    };
+    let message = if matches!(error, CoreError::Worker(message) if message.starts_with("WORKER_BUSY:"))
+    {
+        "Live captions are unavailable while final processing is using Apple MLX. Recording continues normally."
+    } else {
+        "Live captions could not start. Recording continues normally."
+    };
+    CaptionStartFailurePolicy {
+        worker_health,
+        message,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1272,7 +1629,13 @@ struct RecoverableTrack {
     channels: u16,
 }
 
-pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<usize> {
+pub(crate) fn recover_interrupted_recordings(
+    core: &CoreService,
+    startup_session_ids: &BTreeSet<String>,
+) -> CoreResult<usize> {
+    if startup_session_ids.is_empty() {
+        return Ok(0);
+    }
     let connection = core.database().connect()?;
     let mut statement = connection.prepare(
         "SELECT id,meeting_id,config_json,manifest_relative_path,qpc_frequency,qpc_start
@@ -1291,7 +1654,10 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
                 row.get::<_, Option<i64>>(5)?,
             ))
         })?
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(session_id, ..)| startup_session_ids.contains(session_id))
+        .collect::<Vec<_>>();
     drop(statement);
     drop(connection);
 
@@ -1907,7 +2273,7 @@ fn consolidate_track(
             "-c:a".into(),
             "flac".into(),
             "-compression_level".into(),
-            "5".into(),
+            FLAC_COMPRESSION_LEVEL.into(),
             "-f".into(),
             "flac".into(),
             partial.clone(),
@@ -1948,7 +2314,7 @@ fn mix_tracks(
             "-c:a",
             "flac",
             "-compression_level",
-            "5",
+            FLAC_COMPRESSION_LEVEL,
             "-f",
             "flac",
             &partial,
@@ -2098,6 +2464,65 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_rejects_concurrent_start_and_start_during_finalization() {
+        let lifecycle = Arc::new(RecordingLifecycle::new());
+        let start_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_start = Arc::new(std::sync::Barrier::new(2));
+        let thread_lifecycle = lifecycle.clone();
+        let thread_entered = start_entered.clone();
+        let thread_release = release_start.clone();
+        let starter = thread::spawn(move || {
+            let guard = thread_lifecycle.begin_start().unwrap();
+            thread_entered.wait();
+            thread_release.wait();
+            guard.activate();
+        });
+
+        start_entered.wait();
+        assert_eq!(lifecycle.state(), RecordingLifecycleState::Starting);
+        assert!(matches!(
+            lifecycle.begin_start(),
+            Err(CoreError::Conflict(_))
+        ));
+        release_start.wait();
+        starter.join().unwrap();
+        assert_eq!(lifecycle.state(), RecordingLifecycleState::Active);
+
+        let finalizing = lifecycle.begin_finalization().unwrap();
+        assert_eq!(lifecycle.state(), RecordingLifecycleState::Finalizing);
+        assert!(matches!(
+            lifecycle.begin_start(),
+            Err(CoreError::Conflict(_))
+        ));
+        drop(finalizing);
+        assert_eq!(lifecycle.state(), RecordingLifecycleState::Idle);
+    }
+
+    #[test]
+    fn failed_start_releases_lifecycle_guard() {
+        let lifecycle = RecordingLifecycle::new();
+        {
+            let _starting = lifecycle.begin_start().unwrap();
+            assert_eq!(lifecycle.state(), RecordingLifecycleState::Starting);
+        }
+        assert_eq!(lifecycle.state(), RecordingLifecycleState::Idle);
+        assert!(lifecycle.begin_start().is_ok());
+    }
+
+    #[test]
+    fn busy_caption_start_keeps_worker_health_ready() {
+        let policy = caption_start_failure_policy(
+            "ready",
+            &CoreError::Worker(
+                "WORKER_BUSY: Live captions are unavailable while final inference is active."
+                    .into(),
+            ),
+        );
+        assert_eq!(policy.worker_health, "ready");
+        assert!(policy.message.contains("Recording continues normally"));
+    }
+
+    #[test]
     fn elapsed_time_excludes_current_and_completed_pauses() {
         let recording = ActiveRecording {
             id: "s".into(),
@@ -2117,6 +2542,56 @@ mod tests {
             qpc_frequency: None,
         };
         assert!((4_900..=5_100).contains(&elapsed_ms(&recording)));
+    }
+
+    #[test]
+    fn starting_capture_cancellation_signals_stop_and_detaches_the_handle() {
+        let (command_sender, command_receiver) = mpsc::sync_channel(1);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_on_thread = stopped.clone();
+        let handle = thread::spawn(move || {
+            if matches!(command_receiver.recv(), Ok(CaptureCommand::Stop)) {
+                stopped_on_thread.store(true, Ordering::Release);
+            }
+            Err(CoreError::Audio("cancelled test capture".into()))
+        });
+        let mut tracks = [ActiveTrack {
+            track_id: "track".into(),
+            kind: CaptureKind::Microphone,
+            command_sender,
+            handle: Some(handle),
+            shared: Arc::new(CaptureShared::default()),
+        }];
+
+        cancel_starting_tracks(&mut tracks);
+
+        assert!(tracks[0].handle.is_none());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_handle_wait_respects_the_native_stop_deadline() {
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let handle: thread::JoinHandle<CoreResult<CaptureSummary>> = thread::spawn(move || {
+            let _ = release_receiver.recv();
+            Err(CoreError::Audio("released test capture".into()))
+        });
+
+        assert!(!wait_for_capture_handle(
+            &handle,
+            Instant::now() + Duration::from_millis(20),
+        ));
+        release_sender.send(()).unwrap();
+        assert!(wait_for_capture_handle(
+            &handle,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        let _ = handle.join();
     }
 
     #[test]

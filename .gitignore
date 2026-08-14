@@ -43,6 +43,7 @@ backups/
 *.part
 
 # Packaging and signing
+/build/
 artifacts/
 *.msi
 *.msix

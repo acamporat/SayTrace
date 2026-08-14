@@ -48,7 +48,6 @@ import type {
   ProcessingJob,
   RecordingStatus,
   RecordingSession,
-  RecordingLevels,
   TranscriptTurn,
   TranscriptChatMessage,
   VoiceProfile,
@@ -192,10 +191,6 @@ export default function App() {
   const [liveDraftSpeakers, setLiveDraftSpeakers] = useState<
     MeetingSpeaker[]
   >([]);
-  const [recordingLevels, setRecordingLevels] = useState<RecordingLevels>({
-    microphone: desktopRuntime ? 0 : 0.62,
-    system: desktopRuntime ? 0 : 0.59,
-  });
   const [recordingDevices, setRecordingDevices] = useState({
     microphoneDeviceId: "",
     outputDeviceId: "",
@@ -243,6 +238,14 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const toastSequence = useRef(0);
   const recordingSessionRef = useRef<RecordingSession>();
+  const activeTranscriptMeetingIdRef = useRef<string>();
+  const loadedMeetingIdRef = useRef<string>();
+  const mediaUrlRef = useRef<string>();
+  const mediaMeetingIdRef = useRef<string>();
+  const mediaAssetIdRef = useRef<string>();
+  const transcriptMeetingId =
+    view.kind === "transcript" ? view.meetingId : undefined;
+  activeTranscriptMeetingIdRef.current = transcriptMeetingId;
 
   const selectedMeeting = useMemo(() => {
     if (view.kind !== "transcript" && view.kind !== "recording") {
@@ -268,6 +271,48 @@ export default function App() {
   useEffect(() => {
     if (!desktopRuntime) return;
     let alive = true;
+    let meetingRefreshTimer: number | undefined;
+    const pendingMeetingIds = new Set<string>();
+    const latestJobStates = new Map<string, ProcessingJob["state"]>();
+    const scheduleMeetingRefresh = (meetingId?: string) => {
+      if (meetingId) pendingMeetingIds.add(meetingId);
+      if (meetingRefreshTimer !== undefined) {
+        window.clearTimeout(meetingRefreshTimer);
+      }
+      meetingRefreshTimer = window.setTimeout(() => {
+        meetingRefreshTimer = undefined;
+        const activeMeetingId = activeTranscriptMeetingIdRef.current;
+        if (activeMeetingId && pendingMeetingIds.has(activeMeetingId)) {
+          setMeetingRefreshToken((current) => current + 1);
+        }
+        pendingMeetingIds.clear();
+        void invokeCommand("list_meetings")
+          .then((desktopMeetings) => {
+            if (alive) setMeetings(desktopMeetings.map(normalizeMeeting));
+          })
+          .catch(() => undefined);
+      }, 120);
+    };
+    const refreshStartupState = () => {
+      void invokeCommand("get_app_status")
+        .then((status) => {
+          if (!alive) return;
+          setWorkerStatus(status.worker);
+          setRecordingStatus(status.activeRecording);
+        })
+        .catch(() => undefined);
+      void invokeCommand("get_model_status")
+        .then((status) => {
+          if (alive) setModelStatus(status);
+        })
+        .catch(() => undefined);
+      void invokeCommand("list_processing_jobs", {})
+        .then((result) => {
+          if (alive) setJobs(result);
+        })
+        .catch(() => undefined);
+      scheduleMeetingRefresh();
+    };
     void invokeCommand("get_app_status")
       .then((status) => {
         if (!alive) return;
@@ -276,7 +321,6 @@ export default function App() {
         if (status.firstRun && !status.modelReady) {
           setModelStatus((current) => ({
             ...current,
-            runtime: "missing",
             liveModel: "missing",
             finalModel: "missing",
             diarizationModel: "missing",
@@ -316,6 +360,18 @@ export default function App() {
       .catch(() => undefined);
 
     const unlisten: Array<() => void> = [];
+    void listenEvent("startup://changed", () => {
+      refreshStartupState();
+    }).then((dispose) => {
+      if (!alive) {
+        dispose();
+        return;
+      }
+      unlisten.push(dispose);
+      // The completion event can beat WebView listener registration. Querying
+      // immediately after registration closes that gap without a polling loop.
+      refreshStartupState();
+    });
     void listenEvent("transcript://draft-revision", (event) => {
       if (!isDraftRevisionEvent(event)) return;
       const activeSession = recordingSessionRef.current;
@@ -348,25 +404,25 @@ export default function App() {
       });
     }).then((dispose) => unlisten.push(dispose));
     void listenEvent("job://progress", ({ job }) => {
+      const previousState = latestJobStates.get(job.id);
+      latestJobStates.set(job.id, job.state);
       setJobs((current) => [
         job,
         ...current.filter((candidate) => candidate.id !== job.id),
       ]);
-      if (job.state === "completed") {
+      const reachedTerminalState =
+        previousState !== job.state &&
+        ["completed", "failed", "cancelled"].includes(job.state);
+      if (reachedTerminalState && job.state === "completed") {
         notify("Final transcript is ready.");
-      } else if (job.state === "failed") {
+      } else if (reachedTerminalState && job.state === "failed") {
         notify(
           job.errorMessage ?? "Final transcript processing needs attention.",
           "warning",
         );
       }
-      if (["completed", "failed", "cancelled"].includes(job.state)) {
-        setMeetingRefreshToken((current) => current + 1);
-        void invokeCommand("list_meetings")
-          .then((desktopMeetings) =>
-            setMeetings(desktopMeetings.map(normalizeMeeting)),
-          )
-          .catch(() => undefined);
+      if (reachedTerminalState) {
+        scheduleMeetingRefresh(job.meetingId);
       }
     }).then((dispose) => unlisten.push(dispose));
     void listenEvent("model://setup-progress", (progress) => {
@@ -379,13 +435,8 @@ export default function App() {
         error: event.status === "offline" ? "Worker is offline." : undefined,
       }));
     }).then((dispose) => unlisten.push(dispose));
-    void listenEvent("meeting://changed", () => {
-      setMeetingRefreshToken((current) => current + 1);
-      void invokeCommand("list_meetings")
-        .then((desktopMeetings) =>
-          setMeetings(desktopMeetings.map(normalizeMeeting)),
-        )
-        .catch(() => undefined);
+    void listenEvent("meeting://changed", (event) => {
+      scheduleMeetingRefresh(event.meetingId);
     }).then((dispose) => unlisten.push(dispose));
     void listenEvent("recording://state", (session) => {
       recordingSessionRef.current = session;
@@ -398,30 +449,51 @@ export default function App() {
         elapsedMs: session.elapsedMs,
       }));
     }).then((dispose) => unlisten.push(dispose));
-    void listenEvent("recording://levels", (levels) => {
-      setRecordingLevels(levels);
-    }).then((dispose) => unlisten.push(dispose));
     return () => {
       alive = false;
+      if (meetingRefreshTimer !== undefined) {
+        window.clearTimeout(meetingRefreshTimer);
+      }
       unlisten.forEach((dispose) => dispose());
     };
   }, [desktopRuntime]);
 
+  useEffect(
+    () => () => {
+      if (mediaUrlRef.current) URL.revokeObjectURL(mediaUrlRef.current);
+    },
+    [],
+  );
+
   useEffect(() => {
-    if (!desktopRuntime || view.kind !== "transcript") {
-      setMediaUrl((current) => {
-        if (current) URL.revokeObjectURL(current);
-        return undefined;
-      });
+    if (!desktopRuntime || !transcriptMeetingId) {
+      loadedMeetingIdRef.current = undefined;
+      mediaMeetingIdRef.current = undefined;
+      mediaAssetIdRef.current = undefined;
+      if (mediaUrlRef.current) {
+        URL.revokeObjectURL(mediaUrlRef.current);
+        mediaUrlRef.current = undefined;
+      }
+      setMediaUrl(undefined);
       return;
     }
     let alive = true;
-    let objectUrl: string | undefined;
-    setTurns([]);
-    setSpeakers([]);
-    setMarkers([]);
-    setMediaUrl(undefined);
-    void invokeCommand("get_meeting", { meetingId: view.meetingId })
+    const meetingId = transcriptMeetingId;
+    const switchingMeetings = loadedMeetingIdRef.current !== meetingId;
+    if (switchingMeetings) {
+      loadedMeetingIdRef.current = meetingId;
+      setTurns([]);
+      setSpeakers([]);
+      setMarkers([]);
+      if (mediaMeetingIdRef.current !== meetingId) {
+        if (mediaUrlRef.current) URL.revokeObjectURL(mediaUrlRef.current);
+        mediaUrlRef.current = undefined;
+        mediaMeetingIdRef.current = undefined;
+        mediaAssetIdRef.current = undefined;
+        setMediaUrl(undefined);
+      }
+    }
+    void invokeCommand("get_meeting", { meetingId })
       .then(async (detail) => {
         if (!alive) return;
         const meeting = normalizeMeeting(detail.meeting);
@@ -444,9 +516,27 @@ export default function App() {
           ) ??
           detail.assets[0];
         if (preferredAsset) {
+          if (
+            mediaMeetingIdRef.current === meetingId &&
+            mediaAssetIdRef.current === preferredAsset.id &&
+            mediaUrlRef.current
+          ) {
+            return;
+          }
           try {
-            objectUrl = await createAssetObjectUrl(preferredAsset.id);
-            if (alive) setMediaUrl(objectUrl);
+            const nextObjectUrl = await createAssetObjectUrl(preferredAsset.id);
+            if (!alive) {
+              URL.revokeObjectURL(nextObjectUrl);
+              return;
+            }
+            const previousObjectUrl = mediaUrlRef.current;
+            mediaUrlRef.current = nextObjectUrl;
+            mediaMeetingIdRef.current = meetingId;
+            mediaAssetIdRef.current = preferredAsset.id;
+            setMediaUrl(nextObjectUrl);
+            if (previousObjectUrl && previousObjectUrl !== nextObjectUrl) {
+              URL.revokeObjectURL(previousObjectUrl);
+            }
           } catch {
             if (alive) {
               notify(
@@ -462,12 +552,11 @@ export default function App() {
       });
     return () => {
       alive = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [desktopRuntime, meetingRefreshToken, view]);
+  }, [desktopRuntime, meetingRefreshToken, transcriptMeetingId]);
 
   useEffect(() => {
-    if (view.kind !== "transcript") return;
+    if (!transcriptMeetingId) return;
     setAgentError(undefined);
     setAgentLoading(false);
     if (!desktopRuntime) {
@@ -477,14 +566,21 @@ export default function App() {
     let alive = true;
     setChatMessages([]);
     setAgentStatus((current) => ({ ...current, state: "checking" }));
-    void Promise.all([
-      invokeCommand("get_local_agent_status"),
-      invokeCommand("list_transcript_chat", { meetingId: view.meetingId }),
-    ])
-      .then(([status, messages]) => {
+    void invokeCommand("list_transcript_chat", {
+      meetingId: transcriptMeetingId,
+    })
+      .then((messages) => {
         if (!alive) return;
-        setAgentStatus(status);
         setChatMessages(messages);
+      })
+      .catch(() => {
+        if (alive) {
+          setAgentError("The local transcript conversation could not be loaded.");
+        }
+      });
+    void invokeCommand("get_local_agent_status")
+      .then((status) => {
+        if (alive) setAgentStatus(status);
       })
       .catch((error) => {
         if (!alive) return;
@@ -502,7 +598,7 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, [desktopRuntime, view]);
+  }, [desktopRuntime, transcriptMeetingId]);
 
   async function importMedia() {
     setNewDialogOpen(false);
@@ -654,8 +750,8 @@ export default function App() {
         elapsedMs: previewSession.elapsedMs,
         microphoneActive: true,
         systemAudioActive: true,
-        microphoneLevel: recordingLevels.microphone,
-        systemAudioLevel: recordingLevels.system,
+        microphoneLevel: 0.62,
+        systemAudioLevel: 0.59,
         droppedCapturePackets: 0,
         droppedCaptionChunks: 0,
       });
@@ -1597,7 +1693,6 @@ export default function App() {
           markers={markers}
           session={recordingSession}
           status={recordingStatus}
-          levels={recordingLevels}
           microphoneDeviceId={recordingDevices.microphoneDeviceId}
           outputDeviceId={recordingDevices.outputDeviceId}
           microphoneIsPersonal={recordingDevices.microphoneIsPersonal}

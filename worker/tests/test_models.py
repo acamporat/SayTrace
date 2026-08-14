@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import platform
 import sys
 import types
 from pathlib import Path
@@ -26,6 +27,17 @@ def test_shipped_manifest_uses_revision_pins_and_sha256_only() -> None:
         for model in manifest.models
         for item in model.files
     )
+
+
+def test_apple_silicon_manifest_uses_mlx_asr_without_a_second_alignment_model() -> None:
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return
+    manifest = ModelManifest.load()
+    by_key = {model.key: model for model in manifest.models}
+
+    assert "alignment_en" not in by_key
+    assert by_key["live_asr_en"].repository.startswith("mlx-community/")
+    assert by_key["final_asr_en"].repository.startswith("mlx-community/")
 
 
 def test_store_detects_hash_mismatch(tmp_path: Path) -> None:

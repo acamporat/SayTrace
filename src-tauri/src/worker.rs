@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    fs,
+    env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -21,23 +21,48 @@ use crate::{
     layout::AppLayout,
     media_tools::{self, MediaTool},
     models::WorkerStatus,
+    performance::PerformanceSpan,
 };
 
 pub const PROTOCOL_VERSION: &str = "1.0";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const PIPELINE_VERSION: &str = "2026.08.13.1";
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub const PIPELINE_VERSION: &str = "2026.07.28.1";
 pub const MAX_CONTROL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8; 4] = b"LTW1";
 const FRAME_VERSION_MAJOR: u8 = 1;
 const HEADER_BYTES: usize = 16;
-// A first launch of the 5 GB packaged Python/CUDA runtime can spend well over
-// 15 seconds in Windows Defender and DLL loader work before Python executes.
+// A first launch of a packaged ML runtime can spend well over 15 seconds in
+// operating-system validation and dynamic-library loading before Python executes.
 // Pipe closure still reports a crash immediately; this is only the cold-start
 // ceiling for an otherwise live child process.
 const WORKER_HELLO_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const JOB_HEARTBEAT_TIMEOUT_MS: i64 = 60_000;
 const MODEL_SETUP_STALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MODEL_SETUP_OVERALL_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn model_setup_keys() -> &'static [&'static str] {
+    &[
+        "live_asr_en",
+        "final_asr_en",
+        "diarization",
+        "speaker_embedding",
+    ]
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn model_setup_keys() -> &'static [&'static str] {
+    &[
+        "live_asr_en",
+        "final_asr_en",
+        "alignment_en",
+        "diarization",
+        "speaker_embedding",
+    ]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -141,7 +166,12 @@ pub fn write_audio_frame(
     metadata: &AudioMetadata,
     pcm_s16le: &[u8],
 ) -> CoreResult<()> {
-    if pcm_s16le.is_empty() || pcm_s16le.len() % (metadata.channels as usize * 2) != 0 {
+    if metadata.channels == 0
+        || pcm_s16le.is_empty()
+        || !pcm_s16le
+            .len()
+            .is_multiple_of(metadata.channels as usize * 2)
+    {
         return Err(CoreError::InvalidInput(
             "live PCM frame is empty or not sample-aligned".into(),
         ));
@@ -152,11 +182,24 @@ pub fn write_audio_frame(
             "live audio metadata exceeds protocol limits".into(),
         ));
     }
-    let mut payload = Vec::with_capacity(4 + metadata.len() + pcm_s16le.len());
-    payload.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
-    payload.extend_from_slice(&metadata);
-    payload.extend_from_slice(pcm_s16le);
-    write_frame(writer, FrameKind::Audio, 0, &payload)
+    let payload_len = 4_usize
+        .checked_add(metadata.len())
+        .and_then(|length| length.checked_add(pcm_s16le.len()))
+        .ok_or_else(|| CoreError::InvalidInput("live audio frame length overflowed".into()))?;
+    if payload_len > MAX_AUDIO_BYTES {
+        return Err(CoreError::InvalidInput(format!(
+            "worker frame exceeds {MAX_AUDIO_BYTES} byte limit"
+        )));
+    }
+
+    // Write the three payload slices directly to the pipe. The prior encoder
+    // copied every PCM chunk into a second temporary Vec before writing it.
+    write_frame_header(writer, FrameKind::Audio, 0, payload_len)?;
+    writer.write_all(&(metadata.len() as u32).to_be_bytes())?;
+    writer.write_all(&metadata)?;
+    writer.write_all(pcm_s16le)?;
+    writer.flush()?;
+    Ok(())
 }
 
 pub fn read_json_frame(reader: &mut impl Read) -> CoreResult<WorkerEvent> {
@@ -193,12 +236,25 @@ fn write_frame(
             "worker frame exceeds {limit} byte limit"
         )));
     }
-    writer.write_all(MAGIC)?;
-    writer.write_all(&[FRAME_VERSION_MAJOR, kind as u8])?;
-    writer.write_all(&flags.to_be_bytes())?;
-    writer.write_all(&(payload.len() as u64).to_be_bytes())?;
+    write_frame_header(writer, kind, flags, payload.len())?;
     writer.write_all(payload)?;
     writer.flush()?;
+    Ok(())
+}
+
+fn write_frame_header(
+    writer: &mut impl Write,
+    kind: FrameKind,
+    flags: u16,
+    payload_len: usize,
+) -> CoreResult<()> {
+    let mut header = [0_u8; HEADER_BYTES];
+    header[..4].copy_from_slice(MAGIC);
+    header[4] = FRAME_VERSION_MAJOR;
+    header[5] = kind as u8;
+    header[6..8].copy_from_slice(&flags.to_be_bytes());
+    header[8..].copy_from_slice(&(payload_len as u64).to_be_bytes());
+    writer.write_all(&header)?;
     Ok(())
 }
 
@@ -304,6 +360,17 @@ impl WorkerSupervisor {
         self.start_inner()
     }
 
+    fn ensure_started(&self) -> CoreResult<()> {
+        let ready = {
+            let state = self.state.lock();
+            state.process.is_some() && state.state == "ready" && state.error.is_none()
+        };
+        if !ready {
+            self.start()?;
+        }
+        Ok(())
+    }
+
     fn start_inner(&self) -> CoreResult<WorkerStatus> {
         {
             let status = self.status();
@@ -314,6 +381,7 @@ impl WorkerSupervisor {
                 self.stop_inner();
             }
         }
+        let _span = PerformanceSpan::new("worker_start", "phase=process_and_hello");
         let mut command = self.worker_command(false)?;
         command
             .stdin(Stdio::piped())
@@ -403,6 +471,9 @@ impl WorkerSupervisor {
     }
 
     pub fn request(&self, request: WorkerRequest) -> CoreResult<WorkerEvent> {
+        // Control requests are infrequent, so retain the full child/liveness
+        // inspection before writing. The lightweight ready fast path is
+        // reserved for high-frequency live-audio frames.
         self.start()?;
         let mut state = self.state.lock();
         let mut deferred = Vec::new();
@@ -427,6 +498,9 @@ impl WorkerSupervisor {
                 {
                     continue;
                 }
+                let Some(event) = retain_worker_event(event) else {
+                    continue;
+                };
                 if event.request_id.as_deref() == Some(request.request_id.as_str()) {
                     break event;
                 }
@@ -447,6 +521,23 @@ impl WorkerSupervisor {
             return Err(CoreError::Worker(format!("{}: {}", code, message)));
         }
         Ok(event)
+    }
+
+    /// Loads the configured final-processing weights while recording is
+    /// already under way. Call this only from a background task and only when
+    /// live captions are inactive; the worker intentionally rejects prewarm
+    /// while a live session owns the accelerator.
+    pub fn prewarm_performance(&self) -> CoreResult<()> {
+        let components = configured_prewarm_components();
+        if components.is_empty() {
+            return Ok(());
+        }
+        let _span = PerformanceSpan::new("model_prewarm", "profile=configured");
+        self.request(WorkerRequest::new(
+            "performance.prewarm",
+            json!({"components":components}),
+        ))?;
+        Ok(())
     }
 
     pub fn install_model_pack(
@@ -504,13 +595,7 @@ impl WorkerSupervisor {
         let mut progress = Vec::new();
         let setup_started = Instant::now();
         let install_result = (|| -> CoreResult<()> {
-            for key in [
-                "live_asr_en",
-                "final_asr_en",
-                "alignment_en",
-                "diarization",
-                "speaker_embedding",
-            ] {
+            for key in model_setup_keys() {
                 let overall_remaining =
                     MODEL_SETUP_OVERALL_TIMEOUT.saturating_sub(setup_started.elapsed());
                 if overall_remaining.is_zero() {
@@ -563,7 +648,7 @@ impl WorkerSupervisor {
     }
 
     pub fn send_live_audio(&self, metadata: AudioMetadata, pcm: &[u8]) -> CoreResult<()> {
-        self.start()?;
+        self.ensure_started()?;
         let mut state = self.state.lock();
         let process = state
             .process
@@ -639,17 +724,43 @@ impl WorkerSupervisor {
     }
 
     fn worker_command(&self, allow_model_downloads: bool) -> CoreResult<Command> {
-        let packaged = self.layout.runtime().join("local-transcript-worker.exe");
+        let packaged_name = if cfg!(windows) {
+            "local-transcript-worker.exe"
+        } else {
+            "local-transcript-worker"
+        };
+        let packaged = self.layout.runtime().join(packaged_name);
         let worker_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("worker");
         let worker_src = worker_root.join("src");
-        let mut command = if packaged.is_file() {
+        let packaged_runtime_ready =
+            if packaged.is_file() && self.layout.runtime_validation_required() {
+                self.layout.ensure_runtime_validated()?
+            } else {
+                self.layout.runtime_validated()
+            };
+        let mut command = if packaged_runtime_ready && packaged.is_file() {
             Command::new(packaged)
-        } else if worker_src.is_dir() {
-            let packaged_python = self.layout.runtime().join("python").join("python.exe");
-            let project_python = worker_root.join(".venv").join("Scripts").join("python.exe");
-            let executable = if packaged_python.is_file() {
+        } else if cfg!(any(debug_assertions, feature = "development-runtime"))
+            && worker_src.is_dir()
+        {
+            let (packaged_python, project_python) = if cfg!(windows) {
+                (
+                    self.layout.runtime().join("python").join("python.exe"),
+                    worker_root.join(".venv").join("Scripts").join("python.exe"),
+                )
+            } else {
+                (
+                    self.layout
+                        .runtime()
+                        .join("python")
+                        .join("bin")
+                        .join("python3"),
+                    worker_root.join(".venv").join("bin").join("python"),
+                )
+            };
+            let executable = if packaged_runtime_ready && packaged_python.is_file() {
                 packaged_python
             } else if project_python.is_file() {
                 project_python
@@ -692,6 +803,41 @@ impl WorkerSupervisor {
     }
 }
 
+fn configured_prewarm_components() -> Vec<&'static str> {
+    let configured = env::var("SAYTRACE_PREWARM_COMPONENTS").ok();
+    if configured
+        .as_deref()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "off" | "none"))
+    {
+        return Vec::new();
+    }
+
+    let requested = configured.unwrap_or_else(|| {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            "final_asr,diarization".into()
+        } else {
+            String::new()
+        }
+    });
+    let mut components = Vec::new();
+    for component in requested.split(',').map(str::trim) {
+        let component = match component {
+            "final_asr" => "final_asr",
+            "diarization" => "diarization",
+            "speaker_embedding" => "speaker_embedding",
+            "" => continue,
+            unsupported => {
+                log::warn!("ignoring unsupported SAYTRACE_PREWARM_COMPONENTS entry: {unsupported}");
+                continue;
+            }
+        };
+        if !components.contains(&component) {
+            components.push(component);
+        }
+    }
+    components
+}
+
 fn zeroize_request_token(request: &mut WorkerRequest) {
     if let Some(Value::String(secret)) = request.payload.get_mut("token") {
         secret.zeroize();
@@ -708,7 +854,7 @@ fn receive_available_events(state: &mut SupervisorState) {
                 Ok(event) => {
                     if is_worker_liveness_event(&event) {
                         heartbeat = true;
-                    } else {
+                    } else if let Some(event) = retain_worker_event(event) {
                         received.push(event);
                     }
                 }
@@ -725,6 +871,64 @@ fn receive_available_events(state: &mut SupervisorState) {
     }
     if let Some(error) = error_message {
         state.error = Some(error);
+    }
+}
+
+fn retain_worker_event(event: WorkerEvent) -> Option<WorkerEvent> {
+    let Some(event_name) = event.event.as_deref() else {
+        return Some(event);
+    };
+    if !event_name.starts_with("performance_") {
+        return Some(event);
+    }
+
+    // Performance events are observational and must never accumulate in the
+    // functional event queues. Log only a fixed, sanitized metadata subset;
+    // request/job IDs, transcript content, paths, and error messages are
+    // intentionally omitted.
+    let safe = |key: &str| {
+        event
+            .payload
+            .get(key)
+            .and_then(Value::as_str)
+            .map(privacy_safe_telemetry_value)
+            .unwrap_or("none")
+    };
+    let duration_ms = event
+        .payload
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(86_400_000);
+    let cache_hit = event
+        .payload
+        .get("cache_hit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    log::info!(
+        target: "saytrace::performance",
+        "event=worker_timing worker_event={} scope={} component={} stage={} status={} duration_ms={} cache_hit={}",
+        privacy_safe_telemetry_value(event_name),
+        safe("scope"),
+        safe("component"),
+        safe("stage"),
+        safe("status"),
+        duration_ms,
+        cache_hit
+    );
+    None
+}
+
+fn privacy_safe_telemetry_value(value: &str) -> &str {
+    if !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        value
+    } else {
+        "invalid"
     }
 }
 
@@ -1114,6 +1318,30 @@ mod tests {
         }
     }
 
+    fn performance_event(name: &str) -> WorkerEvent {
+        WorkerEvent {
+            message_type: "event".into(),
+            protocol_version: Some(PROTOCOL_VERSION.into()),
+            request_id: None,
+            job_id: None,
+            sequence: Some(1),
+            event: Some(name.into()),
+            error_code: None,
+            message: None,
+            payload: json!({
+                "scope":"pipeline_stage",
+                "component":"final_asr",
+                "stage":"transcribe",
+                "status":"complete",
+                "duration_ms":42,
+                "private_path":"/must/not/be/logged"
+            }),
+            result: Value::Null,
+            ok: None,
+            error: None,
+        }
+    }
+
     #[test]
     fn frame_matches_python_network_order_contract() {
         let request = WorkerRequest::new("ping", json!({"value": 3}));
@@ -1156,6 +1384,36 @@ mod tests {
         let metadata_length = u32::from_be_bytes(encoded[16..20].try_into().unwrap()) as usize;
         assert!(metadata_length > 10);
         assert_eq!(&encoded[20 + metadata_length..], &[0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn audio_frame_rejects_zero_channels_without_panicking() {
+        let metadata = AudioMetadata {
+            session_id: "session".into(),
+            stream_id: "microphone".into(),
+            sequence: 1,
+            start_ms: 0,
+            sample_rate: 48_000,
+            channels: 0,
+            sample_format: "s16le".into(),
+        };
+        assert!(write_audio_frame(&mut Vec::new(), &metadata, &[0, 0]).is_err());
+    }
+
+    #[test]
+    fn observational_performance_events_never_grow_pending_event_storage() {
+        let mut pending_events = VecDeque::new();
+        for _ in 0..1_000 {
+            if let Some(event) = retain_worker_event(performance_event("performance_timing")) {
+                pending_events.push_back(event);
+            }
+        }
+        assert!(pending_events.is_empty());
+
+        let mut response = performance_event("unused");
+        response.event = None;
+        response.message_type = "response".into();
+        assert!(retain_worker_event(response).is_some());
     }
 
     #[test]
@@ -1211,8 +1469,11 @@ mod tests {
 
     #[test]
     fn rust_pipeline_contract_matches_packaged_worker_manifest() {
-        let manifest: Value =
-            serde_json::from_str(include_str!("../../worker/model-manifest.json")).unwrap();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let raw = include_str!("../../worker/model-manifest.macos.json");
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let raw = include_str!("../../worker/model-manifest.json");
+        let manifest: Value = serde_json::from_str(raw).unwrap();
 
         assert_eq!(manifest["pipeline_version"], PIPELINE_VERSION);
     }
