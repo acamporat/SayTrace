@@ -12,7 +12,9 @@ mod media_tools;
 mod models;
 mod performance;
 mod recording;
+mod screen_capture;
 mod service;
+mod visual_context;
 mod worker;
 
 use std::{sync::Arc, thread};

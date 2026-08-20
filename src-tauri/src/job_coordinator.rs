@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender},
         Arc,
     },
     thread,
@@ -41,7 +42,9 @@ const MAX_CANONICAL_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub struct JobCoordinator {
     stop: Arc<AtomicBool>,
     core: Arc<CoreService>,
+    visual_wake: SyncSender<()>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
+    visual_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl JobCoordinator {
@@ -51,16 +54,48 @@ impl JobCoordinator {
         app: AppHandle,
     ) -> CoreResult<Self> {
         let stop = Arc::new(AtomicBool::new(false));
+        let (visual_wake, visual_receiver) = sync_channel(1);
         let thread_stop = stop.clone();
         let thread_core = core.clone();
+        let thread_worker = worker.clone();
+        let thread_app = app.clone();
+        let thread_visual_wake = visual_wake.clone();
         let handle = thread::Builder::new()
             .name("durable-processing-queue".into())
-            .spawn(move || coordinator_loop(thread_core, worker, app, thread_stop))
+            .spawn(move || {
+                coordinator_loop(
+                    thread_core,
+                    thread_worker,
+                    thread_app,
+                    thread_stop,
+                    thread_visual_wake,
+                )
+            })
             .map_err(CoreError::Io)?;
+        let visual_stop = stop.clone();
+        let visual_core = core.clone();
+        let visual_handle = match thread::Builder::new()
+            .name("visual-context-queue".into())
+            .spawn(move || {
+                visual_context_loop(visual_core, worker, app, visual_stop, visual_receiver)
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                stop.store(true, Ordering::Relaxed);
+                core.notify_processing_queue();
+                let _ = handle;
+                return Err(CoreError::Io(error));
+            }
+        };
+        // Startup recovery and newly installed analyzer versions both rely on
+        // a durable database scan rather than an in-memory task list.
+        let _ = visual_wake.try_send(());
         Ok(Self {
             stop,
             core,
+            visual_wake,
             handle: Mutex::new(Some(handle)),
+            visual_handle: Mutex::new(Some(visual_handle)),
         })
     }
 }
@@ -69,10 +104,12 @@ impl Drop for JobCoordinator {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.core.notify_processing_queue();
+        let _ = self.visual_wake.try_send(());
         // A pipeline can be inside a native ML call for a while. Detach here so
         // application shutdown is never held hostage; startup recovery changes
         // the still-running DB row to retry_wait.
         let _ = self.handle.lock().take();
+        let _ = self.visual_handle.lock().take();
     }
 }
 
@@ -113,14 +150,17 @@ fn coordinator_loop(
     worker: Arc<WorkerSupervisor>,
     app: AppHandle,
     stop: Arc<AtomicBool>,
+    visual_wake: SyncSender<()>,
 ) {
     let worker_id = format!("desktop-{}", Uuid::now_v7());
+    let mut attempted_screen_playback_sources = BTreeMap::new();
     while !stop.load(Ordering::Relaxed) {
         let observed_generation = core.processing_queue_generation();
         match claim_next_job(&core, &worker_id) {
             Ok(ClaimResult::Claimed(job)) => {
                 emit_job(&core, &app, &job.id);
-                if let Err(error) = run_claimed_job(&core, &worker, &app, &stop, &job) {
+                if let Err(error) = run_claimed_job(&core, &worker, &app, &stop, &visual_wake, &job)
+                {
                     let _ = fail_job(&core, &job, "HOST_PIPELINE_ERROR", &error.to_string(), true);
                     emit_job(&core, &app, &job.id);
                     let _ = app.emit(
@@ -130,10 +170,47 @@ fn coordinator_loop(
                 }
             }
             Ok(ClaimResult::Idle { retry_at_ms }) => {
-                core.wait_for_processing_queue_change(
-                    observed_generation,
-                    idle_wait_duration(now_ms(), retry_at_ms),
-                );
+                let attempted_screen_playback =
+                    match crate::recording::backfill_next_screen_playback(
+                        &core,
+                        &attempted_screen_playback_sources,
+                    ) {
+                        Ok(Some(backfill)) => {
+                            attempted_screen_playback_sources
+                                .insert(backfill.source_asset_id.clone(), now_ms());
+                            if backfill.created() {
+                                core.invalidate_library_size_cache();
+                                log::info!(
+                                    "created H.264 screen playback derivative for meeting {}",
+                                    backfill.meeting_id
+                                );
+                                let _ = app.emit(
+                                    "meeting://changed",
+                                    json!({
+                                        "meetingId":backfill.meeting_id,
+                                        "reason":"screen_playback_backfilled"
+                                    }),
+                                );
+                            } else if let Some(warning) = &backfill.warning {
+                                log::warn!(
+                                    "screen playback backfill for meeting {} failed: {warning}",
+                                    backfill.meeting_id
+                                );
+                            }
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(error) => {
+                            log::warn!("screen playback backfill poll failed: {error}");
+                            false
+                        }
+                    };
+                if !attempted_screen_playback {
+                    core.wait_for_processing_queue_change(
+                        observed_generation,
+                        idle_wait_duration(now_ms(), retry_at_ms),
+                    );
+                }
             }
             Err(error) => {
                 log::error!("processing queue poll failed: {error}");
@@ -141,6 +218,76 @@ fn coordinator_loop(
             }
         }
     }
+}
+
+fn visual_context_loop(
+    core: Arc<CoreService>,
+    worker: Arc<WorkerSupervisor>,
+    app: AppHandle,
+    stop: Arc<AtomicBool>,
+    wake: Receiver<()>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match wake.recv_timeout(IDLE_SAFETY_POLL) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        while !stop.load(Ordering::Relaxed) {
+            match visual_context_queue_is_idle(&core) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    log::warn!("visual context queue priority check failed: {error}");
+                    break;
+                }
+            }
+            match crate::visual_context::backfill_next_missing_with_worker(&core, &worker) {
+                Ok(Some(backfill)) => {
+                    let created_context = backfill.report.created_context();
+                    if backfill.report.screenshots_created > 0 {
+                        core.invalidate_library_size_cache();
+                    }
+                    log::info!(
+                        "backfilled visual context for meeting {} with {} screen snapshots and {} visual speaker suggestions",
+                        backfill.meeting_id,
+                        backfill.report.screenshots_created,
+                        backfill.report.visual_speakers_suggested
+                    );
+                    for warning in &backfill.report.warnings {
+                        log::warn!(
+                            "visual context backfill for meeting {}: {warning}",
+                            backfill.meeting_id
+                        );
+                    }
+                    if created_context {
+                        let _ = app.emit(
+                            "meeting://changed",
+                            json!({
+                                "meetingId":backfill.meeting_id,
+                                "reason":"visual_context_backfilled"
+                            }),
+                        );
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    log::warn!("visual context backfill failed: {error}");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn visual_context_queue_is_idle(core: &CoreService) -> CoreResult<bool> {
+    let connection = core.database().connect()?;
+    let busy: bool = connection.query_row(
+        "SELECT count(*)>0 FROM processing_jobs
+         WHERE status IN ('queued','running','retry_wait','cancel_requested')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!busy)
 }
 
 #[derive(Debug)]
@@ -232,6 +379,7 @@ fn run_claimed_job(
     worker: &WorkerSupervisor,
     app: &AppHandle,
     stop: &AtomicBool,
+    visual_wake: &SyncSender<()>,
     job: &ClaimedJob,
 ) -> CoreResult<()> {
     let _span = PerformanceSpan::new("final_processing", "source=durable_queue");
@@ -287,6 +435,7 @@ fn run_claimed_job(
                         CoreError::Worker("worker completion did not contain a result".into())
                     })?;
                     commit_canonical_result(core, job, result)?;
+                    let _ = visual_wake.try_send(());
                     emit_job(core, app, &job.id);
                     let _ = app.emit(
                         "meeting://changed",
@@ -399,7 +548,9 @@ fn build_pipeline_payload(core: &CoreService, job: &ClaimedJob) -> CoreResult<Va
             });
         }
     } else {
-        assets.retain(|asset| asset.kind != "playback");
+        // Imported audio/video is validated to contain audio. Screen videos and
+        // generated snapshots are visual evidence, never ASR inputs.
+        assets.retain(|asset| matches!(asset.kind.as_str(), "audio" | "video"));
     }
     if assets.is_empty() {
         return Err(CoreError::InvalidInput(
@@ -726,6 +877,7 @@ fn commit_canonical_result(
     });
     let mut connection = core.database().connect()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stale_visual_snapshot_paths = invalidate_visual_context(&transaction, &job.meeting_id)?;
     transaction.execute(
         "UPDATE model_outputs SET is_canonical=0
          WHERE meeting_id=?1 AND is_canonical=1",
@@ -818,6 +970,7 @@ fn commit_canonical_result(
         params![PIPELINE_VERSION, job.meeting_id],
     )?;
     transaction.commit()?;
+    remove_invalidated_visual_snapshots(core, &job.meeting_id, &stale_visual_snapshot_paths);
     if let Err(error) =
         remove_managed_child_tree(core.layout().library(), core.layout().work(), &job.id)
     {
@@ -831,6 +984,96 @@ fn commit_canonical_result(
     }
     core.invalidate_library_size_cache();
     Ok(())
+}
+
+fn invalidate_visual_context(
+    transaction: &rusqlite::Transaction<'_>,
+    meeting_id: &str,
+) -> CoreResult<Vec<String>> {
+    let snapshot_paths = {
+        let mut statement = transaction.prepare(
+            "SELECT relative_path FROM media_assets
+             WHERE meeting_id=?1 AND kind='screen_snapshot'",
+        )?;
+        let paths = statement
+            .query_map([meeting_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        paths
+    };
+
+    // Unconfirmed visual names are derived from the old canonical turns and
+    // must be eligible for fresh evidence. User-confirmed visual identities
+    // use `visual_confirmed` and deliberately survive reprocessing.
+    let visual_suggestions = {
+        let mut statement = transaction.prepare(
+            "SELECT id,cluster_label FROM meeting_speakers
+             WHERE meeting_id=?1 AND attribution_source='visual'",
+        )?;
+        let suggestions = statement
+            .query_map([meeting_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        suggestions
+    };
+    for (speaker_id, cluster_label) in visual_suggestions {
+        transaction.execute(
+            "UPDATE meeting_speakers
+             SET display_name=?1,profile_id=NULL,match_state='unknown',needs_review=1,
+                 attribution_source='unknown',attribution_confidence=NULL
+             WHERE id=?2 AND meeting_id=?3 AND attribution_source='visual'",
+            params![
+                default_unknown_speaker_name(&cluster_label),
+                speaker_id,
+                meeting_id
+            ],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM visual_context_events WHERE meeting_id=?1",
+        [meeting_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM visual_context_runs WHERE meeting_id=?1",
+        [meeting_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM media_assets WHERE meeting_id=?1 AND kind='screen_snapshot'",
+        [meeting_id],
+    )?;
+    Ok(snapshot_paths)
+}
+
+fn remove_invalidated_visual_snapshots(
+    core: &CoreService,
+    meeting_id: &str,
+    relative_paths: &[String],
+) {
+    for relative_path in relative_paths {
+        let path = match core.layout().resolve_relative(relative_path) {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!(
+                    "invalidated visual snapshot for meeting {meeting_id} had an unsafe path: {error}"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "could not remove invalidated visual snapshot {} for meeting {meeting_id}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+    let screen_context_directory = core
+        .layout()
+        .media()
+        .join(meeting_id)
+        .join("screen-context");
+    let _ = fs::remove_dir(screen_context_directory);
 }
 
 fn prepare_import_playback(
@@ -1140,6 +1383,18 @@ fn import_turn(
     } else {
         None
     };
+    let attribution_source = if profile_id.is_some() {
+        "voice"
+    } else if cluster.starts_with("isolated:") {
+        "isolated_source"
+    } else {
+        "unknown"
+    };
+    let attribution_confidence = match (attribution_source, state) {
+        ("voice", "matched") | ("isolated_source", _) => Some("high"),
+        ("voice", "review") => Some("review"),
+        _ => None,
+    };
     let merged_target = transaction
         .query_row(
             "SELECT target_speaker_id FROM speaker_merge_rules
@@ -1158,8 +1413,9 @@ fn import_turn(
     if merged_target.is_none() {
         transaction.execute(
             "INSERT INTO meeting_speakers(
-                id,meeting_id,cluster_label,display_name,profile_id,match_state,needs_review
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+                id,meeting_id,cluster_label,display_name,profile_id,match_state,needs_review,
+                attribution_source,attribution_confidence
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(meeting_id,cluster_label) DO UPDATE SET
                 display_name=CASE
                     WHEN meeting_speakers.match_state='unknown'
@@ -1180,7 +1436,15 @@ fn import_turn(
                     WHEN meeting_speakers.match_state='unknown'
                      AND (meeting_speakers.display_name IN ('Unknown','Unknown speaker')
                           OR meeting_speakers.display_name GLOB 'Speaker [0-9]*')
-                    THEN excluded.needs_review ELSE meeting_speakers.needs_review END",
+                    THEN excluded.needs_review ELSE meeting_speakers.needs_review END,
+                attribution_source=CASE
+                    WHEN meeting_speakers.match_state='unknown'
+                     AND meeting_speakers.attribution_source='unknown'
+                    THEN excluded.attribution_source ELSE meeting_speakers.attribution_source END,
+                attribution_confidence=CASE
+                    WHEN meeting_speakers.match_state='unknown'
+                     AND meeting_speakers.attribution_source='unknown'
+                    THEN excluded.attribution_confidence ELSE meeting_speakers.attribution_confidence END",
             params![
                 deterministic_speaker_id,
                 meeting_id,
@@ -1188,7 +1452,9 @@ fn import_turn(
                 speaker_name,
                 profile_id,
                 state,
-                i64::from(needs_review)
+                i64::from(needs_review),
+                attribution_source,
+                attribution_confidence
             ],
         )?;
         if state == "matched" {
@@ -1846,6 +2112,69 @@ mod tests {
                 params![job_id, meeting_id, now],
             )
             .unwrap();
+        let old_output_id = Uuid::now_v7().to_string();
+        let old_turn_id = Uuid::now_v7().to_string();
+        let snapshot_id = Uuid::now_v7().to_string();
+        let snapshot = core
+            .layout()
+            .media()
+            .join(&meeting_id)
+            .join("screen-context")
+            .join("stale.jpg");
+        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        fs::write(&snapshot, b"stale jpeg").unwrap();
+        let snapshot_relative = core.layout().relative_to_root(&snapshot).unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_outputs(
+                    id,meeting_id,pipeline_version,model_revisions_json,raw_result_json,
+                    is_canonical,created_at_ms
+                 ) VALUES (?1,?2,?3,'{}','{}',1,?4)",
+                params![old_output_id, meeting_id, PIPELINE_VERSION, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transcript_turns(
+                    id,meeting_id,model_output_id,start_ms,end_ms,model_text,
+                    created_at_ms,updated_at_ms
+                 ) VALUES (?1,?2,?3,0,500,'old canonical turn',?4,?4)",
+                params![old_turn_id, meeting_id, old_output_id, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO media_assets(
+                    id,meeting_id,kind,display_name,relative_path,content_type,size_bytes,
+                    sha256,created_at_ms
+                 ) VALUES (?1,?2,'screen_snapshot','stale.jpg',?3,'image/jpeg',10,'hash',?4)",
+                params![snapshot_id, meeting_id, snapshot_relative, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO visual_context_runs(
+                    meeting_id,screen_asset_id,analyzer_version,status,updated_at_ms
+                 ) VALUES (?1,?2,'old-analyzer','complete',?3)",
+                params![meeting_id, source_asset_id, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO visual_context_events(
+                    id,meeting_id,turn_id,kind,at_ms,screenshot_asset_id,reason,
+                    confidence,source,created_at_ms
+                 ) VALUES (?1,?2,?3,'important_moment',250,?4,'old evidence',
+                           'high','transcript_heuristic',?5)",
+                params![
+                    Uuid::now_v7().to_string(),
+                    meeting_id,
+                    old_turn_id,
+                    snapshot_id,
+                    now
+                ],
+            )
+            .unwrap();
         drop(connection);
 
         let workspace = core.layout().work().join(&job_id);
@@ -1907,6 +2236,19 @@ mod tests {
         assert_eq!(content_type, "audio/wav");
         assert_eq!(duration_ms, 1_000);
         assert!(core.layout().resolve_relative(&relative).unwrap().is_file());
+        let stale_visual_rows: i64 = connection
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM visual_context_runs WHERE meeting_id=?1)
+                  + (SELECT count(*) FROM visual_context_events WHERE meeting_id=?1)
+                  + (SELECT count(*) FROM media_assets
+                     WHERE meeting_id=?1 AND kind='screen_snapshot')",
+                [&meeting_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_visual_rows, 0);
+        assert!(!snapshot.exists());
         assert!(
             !workspace.exists(),
             "completed job scratch workspace should be removed"

@@ -133,7 +133,7 @@ def main() -> int:
         "assets": inputs,
     }
     acceptance = {
-        "schema_version": 2,
+        "schema_version": 3,
         "product": "SayTrace macOS physical acceptance",
         "version": args.version,
         "source_revision": args.source_revision,

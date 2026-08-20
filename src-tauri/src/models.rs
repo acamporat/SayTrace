@@ -72,6 +72,8 @@ pub struct MeetingSpeaker {
     pub match_state: SpeakerMatchState,
     pub needs_review: bool,
     pub color: Option<String>,
+    pub attribution_source: String,
+    pub attribution_confidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +118,25 @@ pub struct TranscriptTurn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VisualContextEvent {
+    pub id: String,
+    pub meeting_id: String,
+    pub turn_id: String,
+    pub kind: String,
+    pub at_ms: i64,
+    pub screenshot_asset_id: Option<String>,
+    pub reason: String,
+    pub trigger_text: Option<String>,
+    pub confidence: String,
+    pub source: String,
+    pub speaker_id: Option<String>,
+    pub suggested_speaker_name: Option<String>,
+    pub meeting_system: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordingMarker {
     pub id: String,
     pub meeting_id: String,
@@ -132,6 +153,7 @@ pub struct MeetingDetail {
     pub speakers: Vec<MeetingSpeaker>,
     pub turns: Vec<TranscriptTurn>,
     pub markers: Vec<RecordingMarker>,
+    pub visual_context: Vec<VisualContextEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +206,30 @@ pub struct ImportMediaResult {
     pub meeting: Meeting,
     pub asset: MediaAsset,
     pub job: ProcessingJob,
+}
+
+/// Durable, local-only visual enrichment policy attached to a managed import.
+///
+/// Presence of this policy on the import processing job is the opt-in marker
+/// used by the background coordinator. Older imports without the marker are
+/// intentionally left alone rather than being swept into an unbounded
+/// historical backfill.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportVisualContextPolicy {
+    #[serde(default = "default_true")]
+    pub auto_screenshots: bool,
+    #[serde(default = "default_true")]
+    pub visual_speaker_attribution: bool,
+}
+
+impl Default for ImportVisualContextPolicy {
+    fn default() -> Self {
+        Self {
+            auto_screenshots: true,
+            visual_speaker_attribution: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +388,12 @@ pub struct RecordingConfig {
     pub live_captions: bool,
     #[serde(default = "default_true")]
     pub microphone_is_personal: bool,
+    #[serde(default)]
+    pub capture_screen: bool,
+    #[serde(default = "default_true")]
+    pub auto_screenshots: bool,
+    #[serde(default = "default_true")]
+    pub visual_speaker_attribution: bool,
 }
 
 impl Default for RecordingConfig {
@@ -353,6 +405,9 @@ impl Default for RecordingConfig {
             loopback_device_id: None,
             live_captions: true,
             microphone_is_personal: true,
+            capture_screen: false,
+            auto_screenshots: true,
+            visual_speaker_attribution: true,
         }
     }
 }
@@ -392,6 +447,7 @@ pub struct RecordingStatus {
     pub elapsed_ms: i64,
     pub microphone_active: bool,
     pub system_audio_active: bool,
+    pub screen_capture_active: bool,
     pub microphone_level: f32,
     pub system_audio_level: f32,
     pub dropped_capture_packets: u64,
@@ -408,6 +464,7 @@ impl Default for RecordingStatus {
             elapsed_ms: 0,
             microphone_active: false,
             system_audio_active: false,
+            screen_capture_active: false,
             microphone_level: 0.0,
             system_audio_level: 0.0,
             dropped_capture_packets: 0,
@@ -575,5 +632,22 @@ mod tests {
         }))
         .unwrap();
         assert!(config.microphone_is_personal);
+        assert!(!config.capture_screen);
+        assert!(config.auto_screenshots);
+        assert!(config.visual_speaker_attribution);
+    }
+
+    #[test]
+    fn imported_video_visual_policy_is_default_on_and_camel_case() {
+        let policy = ImportVisualContextPolicy::default();
+        assert!(policy.auto_screenshots);
+        assert!(policy.visual_speaker_attribution);
+        assert_eq!(
+            serde_json::to_value(policy).unwrap(),
+            serde_json::json!({
+                "autoScreenshots": true,
+                "visualSpeakerAttribution": true
+            })
+        );
     }
 }

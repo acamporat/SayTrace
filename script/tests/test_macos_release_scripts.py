@@ -158,7 +158,7 @@ class MacosReleaseManifestTests(unittest.TestCase):
                         "macos_version": "15.6",
                         "model_identifier": "Mac16,5",
                     },
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "product": "SayTrace macOS physical acceptance",
                     "checks": {
                         name: "passed"

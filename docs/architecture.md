@@ -44,16 +44,32 @@ Rust is SQLite's only writer. The database uses WAL, foreign keys, FTS5, a busy 
 
 ## Recording data flow
 
-1. Dedicated capture threads use WASAPI microphone/render-endpoint loopback on
-   Windows or ScreenCaptureKit microphone/system audio on macOS.
-2. A loss-intolerant writer queue persists separate recoverable PCM segments and
+1. Dedicated capture threads use MMCSS-priority WASAPI microphone/render-endpoint
+   loopback on Windows or one guarded ScreenCaptureKit microphone/system-audio
+   stream on macOS.
+2. When separately authorized, Windows uses a thread-owned FFmpeg `gdigrab`
+   process while macOS attaches a hardware H.264 recording output to that same
+   guarded ScreenCaptureKit owner. macOS records the main display. Both paths
+   save low-frame-rate, cursor-inclusive segments; pause finalizes the current
+   segment and resume starts another.
+3. A loss-intolerant writer queue persists separate recoverable PCM segments and
    appends each checkpoint to a flushed manifest journal.
-3. A separate bounded, droppable queue resamples copies for live draft inference.
-4. Meter and caption events—not raw PCM—cross the WebView boundary.
-5. Stop closes the authoritative sources before any final processing begins.
-6. The final pipeline rereads the sources and replaces the disposable draft.
+4. A separate bounded, droppable queue resamples copies for live draft inference.
+5. Meter, caption, and screen-state events—not raw media—cross the WebView boundary.
+6. Stop closes the authoritative sources before any final processing begins.
+7. The final pipeline rereads the audio sources and replaces the disposable draft.
+   Screen video is consolidated independently and never enters the audio mix.
+8. After the canonical transcript commits, Rust selects bounded transcript-cued
+   moments, extracts durable JPEGs, and may ask an explicitly compatible local
+   Ollama vision model for active-speaker evidence.
 
 Capture never waits for inference. If the worker stalls, draft chunks may be coalesced or dropped while recording continues.
+
+Screen capture and post-processing are deliberately outside the Python worker's
+authority. Rust owns the capture process, timestamps, media paths, SQLite writes,
+and Ollama loopback call. The vision result is evidence with model and event
+provenance, not a confirmed identity: repeated observations can create a review
+suggestion, while user and voice-confirmed assignments take precedence.
 
 ## Durable jobs
 

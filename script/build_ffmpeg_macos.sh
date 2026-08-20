@@ -212,25 +212,27 @@ validate_build_identity() {
     --disable-autodetect \
     --enable-zlib \
     --enable-bzlib \
+    --enable-videotoolbox \
     --disable-gpl \
     --disable-nonfree \
     --disable-version3 \
     --disable-network \
     --disable-shared \
     --enable-static \
-    --disable-swscale \
+    --enable-swscale \
     --disable-hwaccels \
     --disable-encoders \
-    --enable-encoder=flac,pcm_s16le \
+    --enable-encoder=flac,h264_videotoolbox,mjpeg,pcm_s16le,wrapped_avframe \
     --disable-muxers \
-    --enable-muxer=flac,wav \
+    --enable-muxer=flac,image2,mov,mp4,null,wav \
     --disable-demuxers \
-    --enable-demuxer=aac,aiff,asf,avi,concat,flac,loas,m4v,matroska,mov,mp3,mpegps,mpegts,mpegvideo,ogg,wav \
+    --enable-demuxer=aac,aiff,asf,avi,concat,flac,image2,loas,m4v,matroska,mov,mp3,mpegps,mpegts,mpegvideo,ogg,wav \
     --disable-protocols \
-    --enable-protocol=file \
+    --enable-protocol=file,pipe \
     --disable-filters \
-    --enable-filter=adelay,amix,aresample,asetpts,asetrate,loudnorm \
-    --disable-bsfs; do
+    --enable-filter=adelay,amix,aresample,asetpts,asetrate,concat,format,loudnorm,scale,setpts,tpad,trim \
+    --disable-bsfs \
+    --enable-bsf=h264_mp4toannexb; do
     if ! has_buildconf_option "$configuration" "$required_option"; then
       echo "FFmpeg build is missing required configuration: $required_option" >&2
       return 1
@@ -332,24 +334,26 @@ SDK_ROOT="$(xcrun --sdk macosx --show-sdk-path)"
     --disable-autodetect \
     --enable-zlib \
     --enable-bzlib \
+    --enable-videotoolbox \
     --disable-debug \
     --disable-doc \
     --disable-ffplay \
     --disable-avdevice \
     --disable-network \
-    --disable-swscale \
+    --enable-swscale \
     --disable-hwaccels \
     --disable-encoders \
-    --enable-encoder=flac,pcm_s16le \
+    --enable-encoder=flac,h264_videotoolbox,mjpeg,pcm_s16le,wrapped_avframe \
     --disable-muxers \
-    --enable-muxer=flac,wav \
+    --enable-muxer=flac,image2,mov,mp4,null,wav \
     --disable-demuxers \
-    --enable-demuxer=aac,aiff,asf,avi,concat,flac,loas,m4v,matroska,mov,mp3,mpegps,mpegts,mpegvideo,ogg,wav \
+    --enable-demuxer=aac,aiff,asf,avi,concat,flac,image2,loas,m4v,matroska,mov,mp3,mpegps,mpegts,mpegvideo,ogg,wav \
     --disable-protocols \
-    --enable-protocol=file \
+    --enable-protocol=file,pipe \
     --disable-filters \
-    --enable-filter=adelay,amix,aresample,asetpts,asetrate,loudnorm \
+    --enable-filter=adelay,amix,aresample,asetpts,asetrate,concat,format,loudnorm,scale,setpts,tpad,trim \
     --disable-bsfs \
+    --enable-bsf=h264_mp4toannexb \
     --disable-shared \
     --enable-static \
     --enable-pic \

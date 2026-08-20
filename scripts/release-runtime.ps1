@@ -382,9 +382,10 @@ and source materials when publishing the installer.
         cpu_fallback_declared      = $true
         runtime_validation         = [ordered]@{
             worker_handshake = "passed_by_packager"
-            torch_cuda       = [bool]$runtimeHealth.torch_cuda
-            ctranslate2_cuda = [bool]$runtimeHealth.ctranslate2_cuda
-            cpu_fallback     = "required_on_clean_test_machine"
+            required_ml_components = @($runtimeHealth.required_ml_components)
+            torch_cuda             = [bool]$runtimeHealth.torch_cuda
+            ctranslate2_cuda       = [bool]$runtimeHealth.ctranslate2_cuda
+            cpu_fallback           = "required_on_clean_test_machine"
             model_inference  = "not_performed_by_packager"
         }
         ffmpeg                     = [ordered]@{

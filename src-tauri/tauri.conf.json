@@ -11,7 +11,7 @@
   },
   "app": {
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: data: blob:; media-src 'self' asset: localtranscript: http://localtranscript.localhost blob:; connect-src 'self' ipc: http://ipc.localhost http://localtranscript.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'"
+      "csp": "default-src 'self'; img-src 'self' asset: localtranscript: http://localtranscript.localhost data: blob:; media-src 'self' asset: localtranscript: http://localtranscript.localhost blob:; connect-src 'self' ipc: http://ipc.localhost http://localtranscript.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'"
     },
     "windows": [
       {

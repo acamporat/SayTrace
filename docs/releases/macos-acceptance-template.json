@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "product": "SayTrace macOS physical acceptance",
   "version": "REPLACE_WITH_RELEASE_VERSION",
   "source_revision": "REPLACE_WITH_FULL_GIT_COMMIT",
@@ -23,6 +23,11 @@
     "permission_grant_denial_reset_revocation": "not_run",
     "combined_wav_nonempty_and_channels_verified": "not_run",
     "pause_resume_stop_writer_finalization": "not_run",
+    "main_display_screen_video_capture": "not_run",
+    "screen_pause_resume_stop_writer_finalization": "not_run",
+    "h264_screen_playback_and_seek": "not_run",
+    "jpeg_snapshot_extraction_and_custom_protocol_loading": "not_run",
+    "visual_speaker_review_accept_reject": "not_run",
     "long_combined_capture_soak": "not_run",
     "av_clock_alignment": "not_run",
     "no_new_diagnostic_crash_report": "not_run"

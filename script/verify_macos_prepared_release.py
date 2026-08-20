@@ -66,7 +66,7 @@ def validate_acceptance_template(
     if not isinstance(template, dict) or set(template) != EVIDENCE_KEYS:
         raise ValueError("Prepared acceptance template inventory is invalid.")
     expected_identity = {
-        "schema_version": 2,
+        "schema_version": 3,
         "product": "SayTrace macOS physical acceptance",
         "version": version,
         "source_revision": source_revision,

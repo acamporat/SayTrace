@@ -18,6 +18,11 @@ REQUIRED_CHECKS = (
     "permission_grant_denial_reset_revocation",
     "combined_wav_nonempty_and_channels_verified",
     "pause_resume_stop_writer_finalization",
+    "main_display_screen_video_capture",
+    "screen_pause_resume_stop_writer_finalization",
+    "h264_screen_playback_and_seek",
+    "jpeg_snapshot_extraction_and_custom_protocol_loading",
+    "visual_speaker_review_accept_reject",
     "long_combined_capture_soak",
     "av_clock_alignment",
     "no_new_diagnostic_crash_report",
@@ -86,7 +91,7 @@ def validate_evidence(
     if set(data) != EVIDENCE_KEYS:
         raise ValueError("acceptance evidence top-level inventory is not exact")
     expected_identity = {
-        "schema_version": 2,
+        "schema_version": 3,
         "product": "SayTrace macOS physical acceptance",
         "version": version,
         "source_revision": source_revision,

@@ -116,7 +116,7 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertEqual(
             prepared["state"], "awaiting_exact_installer_physical_acceptance"
         )
-        self.assertEqual(acceptance["schema_version"], 2)
+        self.assertEqual(acceptance["schema_version"], 3)
         self.assertEqual(acceptance["installer"], prepared["assets"]["installer"])
         self.assertEqual(
             set(acceptance["checks"]), set(prepared_release.REQUIRED_ACCEPTANCE_CHECKS)

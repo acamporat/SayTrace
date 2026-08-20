@@ -7,7 +7,7 @@ use std::{
         Arc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -23,6 +23,9 @@ use crate::{
     error::{CoreError, CoreResult},
     models::{AudioDevice, AudioDeviceList},
 };
+
+#[cfg(target_os = "macos")]
+use crate::screen_capture::{MacosScreenCaptureRequest, MacosScreenRuntime};
 
 pub const CAPTURE_SAMPLE_RATE: u32 = 48_000;
 pub const SEGMENT_SECONDS: u64 = 30;
@@ -54,11 +57,35 @@ pub struct CaptureSpec {
     pub qpc_frequency: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum CaptureCommand {
     Pause,
+    PauseAcknowledged(mpsc::Sender<CaptureTransition>),
     Resume,
+    ResumeAcknowledged(mpsc::Sender<CaptureTransition>),
     Stop,
+}
+
+/// Timestamp captured by the native capture owner immediately after an audio
+/// gate transition. Recording metadata uses this coordinator event instead of
+/// the later UI-thread acknowledgement time, which may include screen segment
+/// finalization or first-frame latency.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureTransition {
+    pub occurred_at: Instant,
+    pub qpc: Option<u64>,
+    pub wall_time_ms: Option<i64>,
+}
+
+fn capture_transition_now() -> CaptureTransition {
+    CaptureTransition {
+        occurred_at: Instant::now(),
+        qpc: query_performance_counter(),
+        wall_time_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +259,7 @@ pub type CaptureLaunch = (
 pub fn spawn_macos_captures(
     requests: Vec<MacosCaptureRequest>,
     caption_sender: Option<SyncSender<CaptionChunk>>,
+    screen_request: Option<MacosScreenCaptureRequest>,
 ) -> CoreResult<Vec<CaptureLaunch>> {
     validate_macos_capture_kinds(requests.iter().map(|request| request.spec.kind))?;
     for request in &requests {
@@ -281,7 +309,9 @@ pub fn spawn_macos_captures(
 
     if let Err(error) = thread::Builder::new()
         .name("screencapturekit-session".into())
-        .spawn(move || run_macos_capture_coordinator(coordinator_requests, caption_sender))
+        .spawn(move || {
+            run_macos_capture_coordinator(coordinator_requests, caption_sender, screen_request)
+        })
     {
         for (handle, _) in launches {
             let _ = handle.join();
@@ -360,6 +390,7 @@ struct MacosCoordinatorRequest {
 fn run_macos_capture_coordinator(
     requests: Vec<MacosCoordinatorRequest>,
     caption_sender: Option<SyncSender<CaptionChunk>>,
+    screen_request: Option<MacosScreenCaptureRequest>,
 ) {
     let mut inputs = Vec::with_capacity(requests.len());
     let mut result_senders = Vec::with_capacity(requests.len());
@@ -367,7 +398,7 @@ fn run_macos_capture_coordinator(
         inputs.push(request.input);
         result_senders.push(request.result_sender);
     }
-    let results = capture_macos_group(inputs, caption_sender);
+    let results = capture_macos_group(inputs, caption_sender, screen_request);
     for (sender, result) in result_senders.into_iter().zip(results) {
         let _ = sender.send(result.map_err(|error| capture_error_message(&error)));
     }
@@ -377,17 +408,24 @@ fn run_macos_capture_coordinator(
 fn capture_macos_group(
     inputs: Vec<MacosCaptureInput>,
     caption_sender: Option<SyncSender<CaptionChunk>>,
+    screen_request: Option<MacosScreenCaptureRequest>,
 ) -> Vec<CoreResult<CaptureSummary>> {
     let sinks = inputs
         .iter()
         .map(|input| (input.shared.clone(), input.ready_sender.clone()))
         .collect::<Vec<_>>();
     let count = sinks.len();
-    let outcome = capture_macos_group_inner(inputs, caption_sender);
+    let screen_failure = screen_request
+        .as_ref()
+        .map(MacosScreenCaptureRequest::failure_sinks);
+    let outcome = capture_macos_group_inner(inputs, caption_sender, screen_request);
     let results = match outcome {
         Ok(summaries) => summaries.into_iter().map(Ok).collect::<Vec<_>>(),
         Err(error) => {
             let message = capture_error_message(&error);
+            if let Some(screen_failure) = &screen_failure {
+                screen_failure.fail(message.clone());
+            }
             (0..count)
                 .map(|_| Err(CoreError::Audio(message.clone())))
                 .collect::<Vec<_>>()
@@ -418,6 +456,7 @@ fn capture_error_message(error: &CoreError) -> String {
 fn capture_macos_group_inner(
     inputs: Vec<MacosCaptureInput>,
     caption_sender: Option<SyncSender<CaptionChunk>>,
+    screen_request: Option<MacosScreenCaptureRequest>,
 ) -> CoreResult<Vec<CaptureSummary>> {
     use screencapturekit::prelude::*;
     use screencapturekit::stream::delegate_trait::ErrorHandler;
@@ -439,15 +478,18 @@ fn capture_macos_group_inner(
             "ScreenCaptureKit could not access shareable content; allow Screen & System Audio Recording in System Settings: {error}"
         ))
     })?;
-    let display = content
-        .displays()
-        .into_iter()
-        .next()
+    let main_display_id = unsafe { CGMainDisplayID() };
+    let displays = content.displays();
+    let display = displays
+        .iter()
+        .find(|display| display.display_id() == main_display_id)
+        .or_else(|| displays.first())
         .ok_or_else(|| CoreError::Audio("ScreenCaptureKit found no display".into()))?;
     let filter = SCContentFilter::create()
-        .with_display(&display)
+        .with_display(display)
         .with_excluding_windows(&[])
         .build();
+    let captures_screen = screen_request.is_some();
     let captures_microphone = inputs
         .iter()
         .any(|input| input.spec.kind == CaptureKind::Microphone);
@@ -459,15 +501,27 @@ fn capture_macos_group_inner(
     } else {
         inputs[0].spec.channels as i32
     };
+    let (capture_width, capture_height) = if captures_screen {
+        macos_screen_capture_dimensions(display.width(), display.height())
+    } else {
+        (2, 2)
+    };
     let mut configuration = SCStreamConfiguration::new()
-        .with_width(2)
-        .with_height(2)
+        .with_width(capture_width)
+        .with_height(capture_height)
         .with_queue_depth(8)
         .with_sample_rate(CAPTURE_SAMPLE_RATE as i32)
         .with_channel_count(configured_channels)
         .with_captures_audio(captures_audio)
         .with_captures_microphone(captures_microphone)
-        .with_excludes_current_process_audio(true);
+        .with_excludes_current_process_audio(true)
+        .with_shows_cursor(captures_screen);
+    if captures_screen {
+        configuration.set_minimum_frame_interval(&screencapturekit::cm::CMTime::new(
+            1,
+            crate::screen_capture::SCREEN_FRAMES_PER_SECOND as i32,
+        ));
+    }
     if let Some(device_id) = inputs
         .iter()
         .find(|input| input.spec.kind == CaptureKind::Microphone)
@@ -516,6 +570,21 @@ fn capture_macos_group_inner(
             }
         }
     }
+    if registration_error.is_none() && captures_screen {
+        let output_type = SCStreamOutputType::Screen;
+        match owner.stream_mut().add_output_handler(
+            |_sample: CMSampleBuffer, _: SCStreamOutputType| {},
+            output_type,
+        ) {
+            Some(handler_id) => owner.handlers.push((handler_id, output_type)),
+            None => {
+                registration_error = Some(
+                    "ScreenCaptureKit rejected the screen frame output required by recording"
+                        .into(),
+                );
+            }
+        }
+    }
     if let Some(error) = registration_error {
         owner.release_unstarted_locked();
         drop(lifecycle);
@@ -524,6 +593,21 @@ fn capture_macos_group_inner(
         }
         return Err(CoreError::Audio(error));
     }
+    let mut screen_runtime = match screen_request {
+        Some(request) => match MacosScreenRuntime::attach_before_start(request, owner.stream_ref())
+        {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                owner.release_unstarted_locked();
+                drop(lifecycle);
+                for track in &tracks {
+                    track.state.begin_closing();
+                }
+                return Err(CoreError::Audio(error));
+            }
+        },
+        None => None,
+    };
     if let Err(error) = owner.start_locked() {
         drop(lifecycle);
         for track in &tracks {
@@ -538,6 +622,9 @@ fn capture_macos_group_inner(
         Err(error) => {
             for track in &tracks {
                 track.state.begin_closing();
+            }
+            if let Some(screen) = screen_runtime.as_mut() {
+                screen.finish_with_audio(owner.stream_ref());
             }
             let cleanup = owner.stop_and_release_locked().err();
             drop(lifecycle);
@@ -556,6 +643,9 @@ fn capture_macos_group_inner(
             for track in &tracks {
                 track.state.begin_closing();
             }
+            if let Some(screen) = screen_runtime.as_mut() {
+                screen.finish_with_audio(owner.stream_ref());
+            }
             let cleanup = owner.stop_and_release_locked().err();
             drop(lifecycle);
             let suffix = cleanup
@@ -564,6 +654,23 @@ fn capture_macos_group_inner(
             return Err(CoreError::Audio(format!(
                 "ScreenCaptureKit timestamp synchronization was initialized more than once{suffix}"
             )));
+        }
+    }
+    // With screen capture enabled, keep audio callbacks gated until the first
+    // screen frame is confirmed. Both media timelines then begin from the same
+    // serialized ScreenCaptureKit startup transition.
+    if let Some(screen) = screen_runtime.as_mut() {
+        if let Err(error) = screen.mark_stream_started() {
+            for track in &tracks {
+                track.state.begin_closing();
+            }
+            screen.finish_with_audio(owner.stream_ref());
+            let cleanup = owner.stop_and_release_locked().err();
+            drop(lifecycle);
+            let suffix = cleanup
+                .map(|cleanup| format!("; {cleanup}"))
+                .unwrap_or_default();
+            return Err(CoreError::Audio(format!("{error}{suffix}")));
         }
     }
     let mut startup_delegate_error = None;
@@ -577,6 +684,9 @@ fn capture_macos_group_inner(
         for track in &tracks {
             track.state.begin_closing();
         }
+        if let Some(screen) = screen_runtime.as_mut() {
+            screen.finish_with_audio(owner.stream_ref());
+        }
         let cleanup = owner.stop_and_release_locked().err();
         drop(lifecycle);
         let suffix = cleanup
@@ -589,7 +699,8 @@ fn capture_macos_group_inner(
     for track in &tracks {
         let _ = track.ready_sender.try_send(Ok(()));
     }
-    let capture_error = macos_capture_command_loop(&mut tracks);
+    let capture_error =
+        macos_capture_command_loop(&mut tracks, &mut owner, screen_runtime.as_mut());
     for track in &tracks {
         track.state.begin_closing();
     }
@@ -660,6 +771,27 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGMainDisplayID() -> u32;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_screen_capture_dimensions(width: u32, height: u32) -> (u32, u32) {
+    const MAX_CAPTURE_WIDTH: u32 = 2_560;
+    let width = width.max(2);
+    let height = height.max(2);
+    let scale = if width > MAX_CAPTURE_WIDTH {
+        MAX_CAPTURE_WIDTH as f64 / width as f64
+    } else {
+        1.0
+    };
+    let scaled_width = ((width as f64 * scale).round() as u32).max(2) & !1;
+    let scaled_height = ((height as f64 * scale).round() as u32).max(2) & !1;
+    (scaled_width.max(2), scaled_height.max(2))
+}
+
+#[cfg(target_os = "macos")]
 struct MacosTimestampConverter {
     source_clock: screencapturekit::cm::CMClock,
     host_clock: screencapturekit::cm::CMClock,
@@ -725,6 +857,10 @@ impl ManagedMacStream {
 
     fn stream_mut(&mut self) -> &mut screencapturekit::stream::SCStream {
         self.stream.as_mut().expect("managed stream is present")
+    }
+
+    fn stream_ref(&self) -> &screencapturekit::stream::SCStream {
+        self.stream.as_ref().expect("managed stream is present")
     }
 
     fn start_locked(&mut self) -> Result<(), String> {
@@ -912,14 +1048,37 @@ impl Drop for MacosTrackRuntime {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_capture_command_loop(tracks: &mut [MacosTrackRuntime]) -> Option<CoreError> {
+fn macos_capture_command_loop(
+    tracks: &mut [MacosTrackRuntime],
+    owner: &mut ManagedMacStream,
+    mut screen: Option<&mut MacosScreenRuntime>,
+) -> Option<CoreError> {
     loop {
+        let mut processed_audio_command = false;
+        let mut capture_error = None;
         for track in tracks.iter_mut() {
             loop {
                 match track.commands.try_recv() {
-                    Ok(CaptureCommand::Pause) if !track.stopped => track.state.set_paused(true),
-                    Ok(CaptureCommand::Resume) if !track.stopped => track.state.set_paused(false),
+                    Ok(CaptureCommand::Pause) if !track.stopped => {
+                        processed_audio_command = true;
+                        track.state.set_paused(true);
+                    }
+                    Ok(CaptureCommand::PauseAcknowledged(acknowledge)) if !track.stopped => {
+                        processed_audio_command = true;
+                        track.state.set_paused(true);
+                        let _ = acknowledge.send(capture_transition_now());
+                    }
+                    Ok(CaptureCommand::Resume) if !track.stopped => {
+                        processed_audio_command = true;
+                        track.state.set_paused(false);
+                    }
+                    Ok(CaptureCommand::ResumeAcknowledged(acknowledge)) if !track.stopped => {
+                        processed_audio_command = true;
+                        track.state.set_paused(false);
+                        let _ = acknowledge.send(capture_transition_now());
+                    }
                     Ok(CaptureCommand::Stop) | Err(TryRecvError::Disconnected) => {
+                        processed_audio_command = true;
                         track.stopped = true;
                         track.state.begin_closing();
                         break;
@@ -929,13 +1088,46 @@ fn macos_capture_command_loop(tracks: &mut [MacosTrackRuntime]) -> Option<CoreEr
                 }
             }
             if let Some(error) = track.state.error() {
-                return Some(CoreError::Audio(error));
+                capture_error.get_or_insert_with(|| CoreError::Audio(error));
             }
         }
+
+        // A paused group may receive screen Resume before its audio Resume;
+        // active groups defer screen work until the matching audio gate command
+        // arrives. This makes Pause/Stop one serialized transition without
+        // delaying the screen-first Resume contract.
+        let all_audio_paused = tracks
+            .iter()
+            .all(|track| track.stopped || track.state.is_paused());
+        if processed_audio_command || all_audio_paused || capture_error.is_some() {
+            if let Some(screen) = screen.as_deref_mut() {
+                screen.process_commands(owner.stream_ref());
+            }
+        }
+        if let Some(error) = capture_error {
+            finish_macos_screen_on_loop_exit(screen.as_deref_mut(), owner);
+            return Some(error);
+        }
         if tracks.iter().all(|track| track.stopped) {
+            finish_macos_screen_on_loop_exit(screen.as_deref_mut(), owner);
             return None;
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finish_macos_screen_on_loop_exit(
+    screen: Option<&mut MacosScreenRuntime>,
+    owner: &ManagedMacStream,
+) {
+    if let Some(screen) = screen {
+        // Drain controls both before and after idempotent completion. The
+        // second pass acknowledges a Stop that raced with audio shutdown while
+        // `finish_with_audio` was waiting for the native recording callback.
+        screen.process_commands(owner.stream_ref());
+        screen.finish_with_audio(owner.stream_ref());
+        screen.process_commands(owner.stream_ref());
     }
 }
 
@@ -1002,6 +1194,10 @@ impl MacosCaptureState {
             self.pause_boundary.store(1, Ordering::Release);
         }
         self.shared.set_level(0.0);
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire) != 0
     }
 
     fn begin_closing(&self) {
@@ -1808,10 +2004,21 @@ fn capture_thread_inner(
                     paused = true;
                     last_packet_end_qpc = None;
                 }
+                Ok(CaptureCommand::PauseAcknowledged(acknowledge)) => {
+                    paused = true;
+                    last_packet_end_qpc = None;
+                    let _ = acknowledge.send(capture_transition_now());
+                }
                 Ok(CaptureCommand::Resume) => {
                     paused = false;
                     pause_boundary_pending = true;
                     last_packet_end_qpc = None;
+                }
+                Ok(CaptureCommand::ResumeAcknowledged(acknowledge)) => {
+                    paused = false;
+                    pause_boundary_pending = true;
+                    last_packet_end_qpc = None;
+                    let _ = acknowledge.send(capture_transition_now());
                 }
                 Ok(CaptureCommand::Stop) => {
                     stop = true;
@@ -2503,6 +2710,20 @@ mod tests {
             validate_macos_capture_kinds([CaptureKind::Microphone, CaptureKind::Microphone,])
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn screen_video_dimensions_are_even_and_cap_wide_displays() {
+        assert_eq!(
+            macos_screen_capture_dimensions(1_920, 1_080),
+            (1_920, 1_080)
+        );
+        assert_eq!(
+            macos_screen_capture_dimensions(6_016, 3_384),
+            (2_560, 1_440)
+        );
+        assert_eq!(macos_screen_capture_dimensions(1, 1), (2, 2));
     }
 
     #[cfg(target_os = "macos")]

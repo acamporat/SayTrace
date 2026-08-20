@@ -1,7 +1,11 @@
 import { Bookmark, MessageSquare, MoreVertical } from "lucide-react";
 import { memo, useCallback, useMemo, useRef, useState } from "react";
 import { formatDuration } from "../lib/format";
-import type { MeetingSpeaker, TranscriptTurn } from "../types";
+import type {
+  MeetingSpeaker,
+  TranscriptTurn,
+  VisualContextEvent,
+} from "../types";
 import { SpeakerAvatar } from "./SpeakerAvatar";
 
 interface TranscriptRowsProps {
@@ -15,6 +19,8 @@ interface TranscriptRowsProps {
   playedWordId?: string;
   /** Retained for callers that provide a discrete position instead of a word cursor. */
   playbackPositionMs?: number;
+  visualContext?: VisualContextEvent[];
+  visualContextUrls?: Readonly<Record<string, string>>;
   onSelectTurn?: (turnId: string) => void;
   onEdit?: (turnId: string, editedText: string) => void;
   onToggleMarker?: (turnId: string) => void;
@@ -22,6 +28,58 @@ interface TranscriptRowsProps {
 }
 
 type PlaybackState = "past" | "active" | "future" | "none";
+const EMPTY_VISUAL_CONTEXT: VisualContextEvent[] = [];
+const EMPTY_VISUAL_CONTEXT_URLS: Readonly<Record<string, string>> = {};
+
+const VisualContextFigure = memo(function VisualContextFigure({
+  event,
+  screenshotUrl,
+}: {
+  event: VisualContextEvent;
+  screenshotUrl?: string;
+}) {
+  const sourceLabel = event.meetingSystem || "recorded desktop";
+  const alt = `Screen context captured from ${sourceLabel} at ${formatDuration(
+    event.atMs,
+  )}`;
+  return (
+    <figure
+      className="visual-context-card"
+      data-visual-context-id={event.id}
+      onClick={(clickEvent) => clickEvent.stopPropagation()}
+    >
+      {screenshotUrl ? (
+        <img
+          src={screenshotUrl}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+        />
+      ) : (
+        <div
+          className="visual-context-card__unavailable"
+          role="img"
+          aria-label={alt}
+        >
+          Screen context image unavailable
+        </div>
+      )}
+      <figcaption>
+        <span>
+          <strong>Screen context</strong>
+          <small>{sourceLabel}</small>
+        </span>
+        <time dateTime={`PT${Math.max(0, Math.round(event.atMs / 1_000))}S`}>
+          {formatDuration(event.atMs)}
+        </time>
+      </figcaption>
+      <p>{event.reason}</p>
+      {event.triggerText ? (
+        <blockquote>“{event.triggerText}”</blockquote>
+      ) : null}
+    </figure>
+  );
+});
 
 function HighlightedText({ text, query }: { text: string; query?: string }) {
   if (!query?.trim()) return text;
@@ -225,6 +283,8 @@ interface TranscriptRowProps {
   activeWordId?: string;
   playedWordId?: string;
   playbackPositionMs?: number;
+  visualContext: VisualContextEvent[];
+  visualContextUrls: Readonly<Record<string, string>>;
   isLastDraft: boolean;
   menuOpen: boolean;
   onSelectTurn: (turnId: string) => void;
@@ -244,6 +304,8 @@ const TranscriptRow = memo(function TranscriptRow({
   activeWordId,
   playedWordId,
   playbackPositionMs,
+  visualContext,
+  visualContextUrls,
   isLastDraft,
   menuOpen,
   onSelectTurn,
@@ -270,6 +332,16 @@ const TranscriptRow = memo(function TranscriptRow({
       ? turn.words
       : undefined;
   const active = playbackState === "active";
+  const visualSpeakerEvidence = visualContext.find(
+    (event) => event.kind === "speaker_evidence",
+  );
+  const visualAttribution =
+    visualSpeakerEvidence || speaker.attributionSource?.startsWith("visual")
+      ? speaker.attributionSource === "visual_confirmed" ||
+        speaker.attributionConfidence === "confirmed"
+        ? "Visual cue confirmed"
+        : "Visual suggestion"
+      : undefined;
 
   return (
     <article
@@ -283,7 +355,24 @@ const TranscriptRow = memo(function TranscriptRow({
       <time>{formatDuration(turn.startMs)}</time>
       <SpeakerAvatar initials={speaker.initials} color={speaker.color} />
       <div className="transcript-row__content">
-        <strong>{speaker.displayName}</strong>
+        <div className="transcript-row__speaker-line">
+          <strong>{speaker.displayName}</strong>
+          {visualAttribution ? (
+            <span
+              className={`visual-attribution-badge${
+                visualAttribution === "Visual suggestion"
+                  ? " is-review"
+                  : " is-confirmed"
+              }`}
+              title={
+                visualSpeakerEvidence?.reason ??
+                "Speaker attribution includes local visual context."
+              }
+            >
+              {visualAttribution}
+            </span>
+          ) : null}
+        </div>
         {editable ? (
           <div
             className="transcript-row__editor"
@@ -328,6 +417,23 @@ const TranscriptRow = memo(function TranscriptRow({
             ) : null}
           </p>
         )}
+        {visualContext
+          .filter(
+            (event) =>
+              event.kind !== "speaker_evidence" &&
+              Boolean(event.screenshotAssetId),
+          )
+          .map((event) => (
+            <VisualContextFigure
+              key={event.id}
+              event={event}
+              screenshotUrl={
+                event.screenshotAssetId
+                  ? visualContextUrls[event.screenshotAssetId]
+                  : undefined
+              }
+            />
+          ))}
       </div>
       {editable ? (
         <div className="transcript-row__actions">
@@ -389,6 +495,8 @@ export function TranscriptRows({
   activeWordId,
   playedWordId,
   playbackPositionMs,
+  visualContext = EMPTY_VISUAL_CONTEXT,
+  visualContextUrls = EMPTY_VISUAL_CONTEXT_URLS,
   onSelectTurn,
   onEdit,
   onToggleMarker,
@@ -432,6 +540,15 @@ export function TranscriptRows({
     setOpenTurnMenu((current) => (current === turnId ? undefined : turnId));
   }, []);
   const lastTurnId = turns[turns.length - 1]?.id;
+  const visualContextByTurn = useMemo(() => {
+    const grouped = new Map<string, VisualContextEvent[]>();
+    for (const event of visualContext) {
+      const current = grouped.get(event.turnId);
+      if (current) current.push(event);
+      else grouped.set(event.turnId, [event]);
+    }
+    return grouped;
+  }, [visualContext]);
 
   return (
     <div className="transcript-rows">
@@ -445,6 +562,8 @@ export function TranscriptRows({
                 ? "active"
                 : "future";
         const active = playbackState === "active";
+        const turnVisualContext =
+          visualContextByTurn.get(turn.id) ?? EMPTY_VISUAL_CONTEXT;
         return (
           <TranscriptRow
             key={turn.id}
@@ -459,6 +578,8 @@ export function TranscriptRows({
             activeWordId={active ? activeWordId : undefined}
             playedWordId={active ? playedWordId : undefined}
             playbackPositionMs={playbackPositionMs}
+            visualContext={turnVisualContext}
+            visualContextUrls={visualContextUrls}
             isLastDraft={turn.id === lastTurnId}
             menuOpen={openTurnMenu === turn.id}
             onSelectTurn={selectTurn}

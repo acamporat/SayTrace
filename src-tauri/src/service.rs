@@ -35,6 +35,17 @@ const MODEL_MANIFEST_JSON: &str = include_str!("../../worker/model-manifest.json
 pub(crate) const VOICE_PROFILE_MIN_SAMPLES: i64 = 1;
 pub(crate) const VOICE_PROFILE_MIN_CLEAN_DURATION_MS: i64 = 10_000;
 
+fn managed_import_job_input(asset_id: &str, relative_path: &str) -> String {
+    json!({
+        "assetId": asset_id,
+        "sourceKind": "managed_import",
+        "relativePath": relative_path,
+        "pipelineVersion": crate::worker::PIPELINE_VERSION,
+        "visualContext": ImportVisualContextPolicy::default(),
+    })
+    .to_string()
+}
+
 #[derive(Debug, Deserialize)]
 struct BundledModelManifest {
     pipeline_version: String,
@@ -314,7 +325,10 @@ impl CoreService {
         title: Option<String>,
     ) -> CoreResult<ImportMediaResult> {
         media::validate_source(source_path)?;
-        let probe = media::probe(&self.layout, source_path)?;
+        // Reject unsupported media before copying it, then probe the managed
+        // bytes again below so a changing source cannot make persisted stream
+        // metadata disagree with what the worker actually receives.
+        media::probe(&self.layout, source_path)?;
         let meeting_id = new_id();
         let asset_id = new_id();
         let job_id = new_id();
@@ -325,6 +339,13 @@ impl CoreService {
         let destination_directory = self.layout.media().join(&meeting_id).join(&asset_id);
         let destination = destination_directory.join(original_name);
         let (size_bytes, sha256) = media::atomic_copy_with_hash(source_path, &destination)?;
+        let probe = match media::probe(&self.layout, &destination) {
+            Ok(probe) => probe,
+            Err(error) => {
+                let _ = fs::remove_file(&destination);
+                return Err(error);
+            }
+        };
         let relative = self.layout.relative_to_root(&destination)?;
         let now = now_ms();
         let title = title
@@ -337,13 +358,7 @@ impl CoreService {
                     .unwrap_or("Imported meeting")
                     .to_string()
             });
-        let input_json = json!({
-            "assetId": asset_id,
-            "sourceKind": "managed_import",
-            "relativePath": relative,
-            "pipelineVersion": crate::worker::PIPELINE_VERSION,
-        })
-        .to_string();
+        let input_json = managed_import_job_input(&asset_id, &relative);
 
         let write_result = (|| -> CoreResult<()> {
             let mut connection = self.database.connect()?;
@@ -468,7 +483,7 @@ impl CoreService {
 
         let mut speaker_statement = connection.prepare(
             "SELECT id,meeting_id,cluster_label,display_name,profile_id,match_state,
-                    needs_review,color
+                    needs_review,color,attribution_source,attribution_confidence
              FROM meeting_speakers WHERE meeting_id=?1 ORDER BY cluster_label",
         )?;
         let mut speakers = speaker_statement
@@ -522,12 +537,40 @@ impl CoreService {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut visual_statement = connection.prepare(
+            "SELECT id,meeting_id,turn_id,kind,at_ms,screenshot_asset_id,reason,
+                    trigger_text,confidence,source,speaker_id,suggested_speaker_name,
+                    meeting_system,created_at_ms
+             FROM visual_context_events WHERE meeting_id=?1 ORDER BY at_ms,id",
+        )?;
+        let visual_context = visual_statement
+            .query_map([meeting_id], |row| {
+                Ok(VisualContextEvent {
+                    id: row.get(0)?,
+                    meeting_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    at_ms: row.get(4)?,
+                    screenshot_asset_id: row.get(5)?,
+                    reason: row.get(6)?,
+                    trigger_text: row.get(7)?,
+                    confidence: row.get(8)?,
+                    source: row.get(9)?,
+                    speaker_id: row.get(10)?,
+                    suggested_speaker_name: row.get(11)?,
+                    meeting_system: row.get(12)?,
+                    created_at_ms: row.get(13)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(MeetingDetail {
             meeting,
             assets,
             speakers,
             turns,
             markers,
+            visual_context,
         })
     }
 
@@ -965,13 +1008,15 @@ impl CoreService {
             )?;
             transaction.execute(
                 "UPDATE meeting_speakers
-                 SET display_name=?1,profile_id=?2,match_state='matched',needs_review=0
+                 SET display_name=?1,profile_id=?2,match_state='matched',needs_review=0,
+                     attribution_source='user',attribution_confidence='confirmed'
                  WHERE id=?3 AND meeting_id=?4",
                 params![name, saved_profile_id, speaker_id, meeting_id],
             )?;
         } else {
             transaction.execute(
-                "UPDATE meeting_speakers SET display_name=?1
+                "UPDATE meeting_speakers
+                 SET display_name=?1,attribution_source='user',attribution_confidence='confirmed'
                  WHERE id=?2 AND meeting_id=?3",
                 params![name, speaker_id, meeting_id],
             )?;
@@ -1103,12 +1148,16 @@ impl CoreService {
         let updated = if accepted {
             connection.execute(
                 "UPDATE meeting_speakers
-                 SET display_name=(
-                         SELECT display_name FROM voice_profiles
-                         WHERE voice_profiles.id=meeting_speakers.profile_id
-                     ),
-                     match_state='matched',needs_review=0
-                 WHERE id=?1 AND profile_id IS NOT NULL",
+                 SET display_name=CASE WHEN profile_id IS NOT NULL THEN (
+                        SELECT display_name FROM voice_profiles
+                        WHERE voice_profiles.id=meeting_speakers.profile_id
+                     ) ELSE display_name END,
+                     match_state='matched',needs_review=0,
+                     attribution_source=CASE
+                        WHEN attribution_source='visual' THEN 'visual_confirmed'
+                        ELSE 'voice_confirmed' END,
+                     attribution_confidence='confirmed'
+                 WHERE id=?1 AND (profile_id IS NOT NULL OR attribution_source='visual')",
                 [speaker_id],
             )?
         } else {
@@ -1124,7 +1173,8 @@ impl CoreService {
             connection.execute(
                 "UPDATE meeting_speakers
                  SET profile_id=NULL,display_name=?1,
-                     match_state='unknown',needs_review=1
+                     match_state='unknown',needs_review=1,
+                     attribution_source='unknown',attribution_confidence=NULL
                  WHERE id=?2",
                 params![default_name, speaker_id],
             )?
@@ -1788,13 +1838,22 @@ impl CoreService {
             {
                 continue;
             }
+            let final_path = PathBuf::from(
+                path.to_string_lossy()
+                    .strip_suffix(".partial")
+                    .unwrap_or_default(),
+            );
+            if final_path.exists() {
+                log::warn!(
+                    "leaving in-progress recording segment {:?} untouched because finalized \
+                     segment {:?} already exists",
+                    path,
+                    final_path
+                );
+                continue;
+            }
             match repair_wav_header(&path) {
                 Ok(()) => {
-                    let final_path = PathBuf::from(
-                        path.to_string_lossy()
-                            .strip_suffix(".partial")
-                            .unwrap_or_default(),
-                    );
                     if let Err(error) = fs::rename(&path, final_path) {
                         log::warn!("could not finalize repaired recording segment: {error}");
                     }
@@ -1826,7 +1885,11 @@ fn meeting_select_sql() -> &'static str {
             (SELECT count(*) FROM meeting_speakers s WHERE s.meeting_id=m.id),
             (SELECT count(*) FROM media_assets a WHERE a.meeting_id=m.id),
             (SELECT a.id FROM media_assets a WHERE a.meeting_id=m.id
-             ORDER BY CASE WHEN a.kind='playback' THEN 0 ELSE 1 END,a.created_at_ms LIMIT 1),
+             ORDER BY CASE a.kind
+                WHEN 'playback' THEN 0 WHEN 'mixed' THEN 1
+                WHEN 'microphone' THEN 2 WHEN 'loopback' THEN 3
+                WHEN 'audio' THEN 4 WHEN 'video' THEN 5 ELSE 9 END,
+                a.created_at_ms LIMIT 1),
             m.needs_review,m.recovery_warning
      FROM meetings m"
 }
@@ -1904,6 +1967,8 @@ fn map_speaker(row: &Row<'_>) -> rusqlite::Result<MeetingSpeaker> {
             row.get::<_, Option<String>>(7)?
                 .unwrap_or_else(|| color_for(&id)),
         ),
+        attribution_source: row.get(8)?,
+        attribution_confidence: row.get(9)?,
     })
 }
 
@@ -2386,6 +2451,47 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let service = CoreService::open(temp.path()).unwrap();
         (temp, service)
+    }
+
+    #[test]
+    fn recording_partial_repair_never_replaces_an_existing_finalized_segment() {
+        let (_temp, service) = service();
+        let directory = service
+            .layout
+            .recordings()
+            .join("meeting")
+            .join("session")
+            .join("microphone");
+        fs::create_dir_all(&directory).unwrap();
+        let finalized = directory.join("segment-00001.wav");
+        let partial = directory.join("segment-00001.wav.partial");
+        fs::write(&finalized, b"already finalized").unwrap();
+        fs::write(&partial, b"still in progress").unwrap();
+        let finalized_before = fs::read(&finalized).unwrap();
+        let partial_before = fs::read(&partial).unwrap();
+        let recovery_scope = StartupRecoveryScope {
+            captured_at_ms: i64::MAX,
+            recording_session_ids: BTreeSet::from(["session".to_string()]),
+            recording_meeting_ids: BTreeSet::new(),
+        };
+
+        service.repair_recording_partials(&recovery_scope).unwrap();
+
+        assert_eq!(fs::read(finalized).unwrap(), finalized_before);
+        assert_eq!(fs::read(partial).unwrap(), partial_before);
+    }
+
+    #[test]
+    fn managed_import_job_input_persists_default_on_visual_policy() {
+        let value: serde_json::Value = serde_json::from_str(&managed_import_job_input(
+            "asset",
+            "library/media/video.mp4",
+        ))
+        .unwrap();
+        assert_eq!(value["assetId"], "asset");
+        assert_eq!(value["sourceKind"], "managed_import");
+        assert_eq!(value["visualContext"]["autoScreenshots"], true);
+        assert_eq!(value["visualContext"]["visualSpeakerAttribution"], true);
     }
 
     #[test]
@@ -3084,6 +3190,47 @@ mod tests {
         assert_eq!(speaker.profile_id, None);
         assert_eq!(speaker.match_state, SpeakerMatchState::Unknown);
         assert!(speaker.needs_review);
+    }
+
+    #[test]
+    fn accepting_visual_speaker_evidence_requires_review_and_preserves_provenance() {
+        let (_temp, service) = service();
+        let connection = service.database.connect().unwrap();
+        let now = now_ms();
+        let meeting_id = new_id();
+        let speaker_id = new_id();
+        connection
+            .execute(
+                "INSERT INTO meetings(id,title,source_kind,status,created_at_ms)
+                 VALUES (?1,'Visual evidence','recording','ready',?2)",
+                params![meeting_id, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO meeting_speakers(
+                    id,meeting_id,cluster_label,display_name,match_state,needs_review,
+                    attribution_source,attribution_confidence
+                 ) VALUES (?1,?2,'speaker-0','Jordan Lee','review',1,'visual','review')",
+                params![speaker_id, meeting_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        service.review_speaker_match(&speaker_id, true).unwrap();
+
+        let speaker = service
+            .get_meeting(&meeting_id)
+            .unwrap()
+            .speakers
+            .into_iter()
+            .find(|speaker| speaker.id == speaker_id)
+            .unwrap();
+        assert_eq!(speaker.display_name, "Jordan Lee");
+        assert_eq!(speaker.match_state, SpeakerMatchState::Matched);
+        assert_eq!(speaker.attribution_source, "visual_confirmed");
+        assert_eq!(speaker.attribution_confidence.as_deref(), Some("confirmed"));
+        assert!(!speaker.needs_review);
     }
 
     #[test]

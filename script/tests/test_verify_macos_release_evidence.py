@@ -28,7 +28,7 @@ class MacOSReleaseEvidenceTests(unittest.TestCase):
         self.installer = self.root / "SayTrace-0.3.0-macos-arm64.dmg"
         self.installer.write_bytes(b"signed and notarized installer")
         self.payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "product": "SayTrace macOS physical acceptance",
             "version": "0.3.0",
             "source_revision": "a" * 40,

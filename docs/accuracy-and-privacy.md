@@ -12,6 +12,15 @@ The product favors precision over coverage:
 - Uncertain or short clusters remain `Unknown`.
 - Similarity values are not displayed as probabilities.
 
+Visual meeting context is a separate evidence source, not biometric identity.
+SayTrace may inspect locally captured frames for a visible participant label,
+profile tile, or active-speaker treatment. It requires agreeing observations
+from distinct turns and a clear winner before proposing a display name. The
+proposal remains `Review` until a person accepts it, records the model and
+meeting-system provenance, and never overwrites a manual or voice-confirmed
+assignment. Missing, ambiguous, stale, or unsupported meeting UI stays
+`Unknown`.
+
 The release calibration target is at least 99% precision for automatically accepted
 names and less than 1% false acceptance of unknown speakers. The checked-in
 thresholds are conservative starting values, not evidence that this gate has been
@@ -62,3 +71,20 @@ Community-1 terms. After setup:
 - network access is enabled only for explicit model provisioning.
 
 Offline acceptance testing blocks DNS and outbound traffic and removes the setup token before a complete transcription run.
+
+## Screen recording boundary
+
+Main-display recording is enabled by default on macOS, but it is not silently
+implied by enabling audio recording: a separate review step
+blocks recording until the user acknowledges the disclosure or deliberately
+chooses audio-only capture. The saved track can include notifications,
+credentials, unrelated applications, and any other pixels visible on the main
+display. Extracted screenshots are ordinary local JPEG files governed
+by the same retention and deletion behavior as the meeting.
+SayTrace does not redact them automatically; users should close or hide sensitive
+content before capture and use FileVault when at-rest protection is required.
+
+Automatic screenshot selection is deterministic and bounded. Transcript cues
+such as a direct reference to shared material nominate timestamps, but this is a
+relevance heuristic rather than a claim that every important visual—or only an
+important visual—will be selected.

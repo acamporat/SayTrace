@@ -5,9 +5,9 @@ runs locally through MLX/Metal; diarization and speaker embeddings use PyTorch
 MPS when supported and fall back to CPU. NVIDIA CUDA is not used on macOS.
 
 The normal local `.app` is Rust-release-optimized and uses the project's Python
-environment and Homebrew FFmpeg. A release-packaging path can stage a
-self-contained Python/MLX worker, but signing, notarization, and a
-redistributable FFmpeg payload remain release gates.
+environment and Homebrew FFmpeg. The release-packaging path stages a
+self-contained Python/MLX worker and the verified redistributable FFmpeg build;
+signing, notarization, and physical acceptance remain release gates.
 
 ## Prerequisites
 
@@ -112,13 +112,19 @@ durations—not recording titles, transcript text, audio, or filesystem paths.
 The browser-only interface remains available with `npm run dev`, but it does
 not exercise the Rust host, audio capture, Keychain, or MLX worker.
 
-## Audio capture lifecycle
+## Capture lifecycle
 
 On macOS, microphone and system audio are two output handlers on one
-ScreenCaptureKit `SCStream`. The recording coordinator owns the stream and is
-the only code allowed to start, stop, remove handlers, or release it. Shutdown
-first rejects new callbacks, then stops the native stream, drains callbacks,
-and finally closes the WAV writers.
+ScreenCaptureKit `SCStream`. When screen recording is enabled, the coordinator
+attaches an `SCRecordingOutput` to that same stream for hardware H.264 capture
+of the main display at 5 fps. It never starts an overlapping independent stream.
+Pause removes and finalizes the current screen segment; resume attaches a new
+one. Because Apple's recording output follows the stream's enabled audio inputs,
+each native segment is immediately remuxed to video-only before publication.
+The recording coordinator owns the stream and is the only code allowed to
+start, stop, remove handlers or recording outputs, or release it. Shutdown first
+rejects new callbacks, finalizes the screen output, stops the native stream,
+drains callbacks, and finally closes the WAV writers.
 
 This ownership is deliberate. Do not split the two sources into independently
 started streams or rely on `SCStream`'s Rust `Drop` implementation to stop an
@@ -134,7 +140,10 @@ Before treating capture as release-ready on a physical Mac, validate:
 - repeated microphone-only, system-only, and combined start/stop cycles;
 - permission grant, denial, reset, and revocation paths;
 - non-empty, correctly channeled WAV output from both combined outputs;
-- pause/resume and stop with no callback writes after writer finalization;
+- main-display H.264 capture with the cursor, a video-only final asset, and
+  readable inline JPEG extraction;
+- pause/resume and stop with no callback writes after writer finalization or
+  screen-output removal;
 - a long combined-capture soak with stable memory and A/V clock alignment; and
 - no new `local-transcript*.ips` report in `~/Library/Logs/DiagnosticReports`.
 
@@ -144,7 +153,8 @@ The first recording triggers macOS consent prompts. Grant SayTrace access in
 **System Settings > Privacy & Security** for:
 
 - **Microphone**, for microphone capture;
-- **Screen & System Audio Recording**, for system audio capture; and
+- **Screen & System Audio Recording**, for system audio and optional main-display
+  video capture; and
 - requested files or folders when importing or exporting outside the app data
   directory.
 
@@ -314,8 +324,11 @@ sw_vers -productVersion
 The computed digest must exactly match the template. Install from that DMG and
 perform every listed check, including clean first run, repeated microphone-only,
 system-audio-only, and combined capture, permission grant/denial/reset/revocation,
-WAV channel and finalization checks, the combined-capture soak and A/V clock
-check, and the diagnostic-crash-report check. In a copied acceptance JSON:
+WAV channel and finalization checks, main-display screen capture, pause/resume,
+H.264 playback and seeking, JPEG snapshot extraction through the app's custom
+asset protocol, visual-speaker accept/reject review, the combined-capture soak
+and A/V clock check, and the diagnostic-crash-report check. In a copied
+acceptance JSON:
 
 - replace the UTC timestamp and hardware placeholders;
 - change every check, including

@@ -540,6 +540,20 @@ impl WorkerSupervisor {
         Ok(())
     }
 
+    /// Frees idle resident transcription backends before Ollama reserves
+    /// unified memory for visual analysis. A stopped worker has no resident
+    /// models, so this deliberately does not launch one just to release it.
+    pub fn release_idle_performance_models_for_visual(&self) -> CoreResult<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if self.status().process_id.is_none() {
+                return Ok(());
+            }
+            self.request(WorkerRequest::new("performance.release", json!({})))?;
+        }
+        Ok(())
+    }
+
     pub fn install_model_pack(
         &self,
         token: &str,
