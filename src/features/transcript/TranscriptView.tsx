@@ -14,6 +14,7 @@ import {
   Merge,
   MessageSquare,
   MoreVertical,
+  Monitor,
   Pause,
   Pencil,
   Play,
@@ -40,6 +41,7 @@ import type {
   SpeakerState,
   TranscriptChatMessage,
   TranscriptTurn,
+  VisualContextEvent,
   VoiceProfile,
 } from "../../types";
 import { SpeakerAvatar } from "../../components/SpeakerAvatar";
@@ -52,10 +54,13 @@ type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
 interface TranscriptViewProps {
   meeting: Meeting;
   mediaSourceUrl?: string;
+  screenSourceUrl?: string;
   allowSimulatedPlayback: boolean;
   turns: TranscriptTurn[];
   speakers: MeetingSpeaker[];
   markers: Marker[];
+  visualContext: VisualContextEvent[];
+  visualContextUrls: Readonly<Record<string, string>>;
   processingJob?: ProcessingJob;
   profiles: VoiceProfile[];
   profileSampleTargetId?: string;
@@ -106,6 +111,7 @@ interface SpeakerCardProps {
   onRename: (name: string) => void;
   onMerge: (targetId: string) => void;
   suggestedProfileName?: string;
+  visualEvidence?: VisualContextEvent;
   onAcceptReview: () => void;
   onRejectReview: () => void;
 }
@@ -117,6 +123,7 @@ function SpeakerCard({
   onRename,
   onMerge,
   suggestedProfileName,
+  visualEvidence,
   onAcceptReview,
   onRejectReview,
 }: SpeakerCardProps) {
@@ -134,6 +141,11 @@ function SpeakerCard({
     }
     setEditing(false);
   }
+
+  const visualSuggestion =
+    speaker.attributionSource === "visual" || Boolean(visualEvidence);
+  const visualSuggestionName = visualEvidence?.suggestedSpeakerName ??
+    (speaker.attributionSource === "visual" ? speaker.displayName : undefined);
 
   return (
     <div
@@ -215,6 +227,28 @@ function SpeakerCard({
         />
       </div>
 
+      {visualEvidence || speaker.attributionSource?.startsWith("visual") ? (
+        <div
+          className={`speaker-card__visual-evidence${
+            speaker.attributionSource === "visual_confirmed" ||
+            speaker.attributionConfidence === "confirmed"
+              ? " is-confirmed"
+              : " is-review"
+          }`}
+        >
+          <strong>
+            {speaker.attributionSource === "visual_confirmed" ||
+            speaker.attributionConfidence === "confirmed"
+              ? "Visual cue confirmed"
+              : "Visual suggestion · Review"}
+          </strong>
+          <p>
+            {visualEvidence?.reason ??
+              "Local meeting-app visual context contributed to this speaker suggestion."}
+          </p>
+        </div>
+      ) : null}
+
       {mergeOpen ? (
         <div className="speaker-card__merge">
           <span>Merge into</span>
@@ -241,13 +275,15 @@ function SpeakerCard({
           <button
             className="speaker-card__review"
             type="button"
-            disabled={!suggestedProfileName}
+            disabled={!suggestedProfileName && !visualSuggestion}
             onClick={onAcceptReview}
           >
             <Check size={16} />{" "}
             {suggestedProfileName
               ? `Accept ${suggestedProfileName}`
-              : "No suggested match"}
+              : visualSuggestionName
+                ? `Accept ${visualSuggestionName}`
+                : "No suggested match"}
           </button>
           <button type="button" onClick={onRejectReview}>
             <X size={15} /> Keep unknown
@@ -290,10 +326,13 @@ function findActiveWordId(
 export function TranscriptView({
   meeting,
   mediaSourceUrl,
+  screenSourceUrl,
   allowSimulatedPlayback,
   turns,
   speakers,
   markers,
+  visualContext,
+  visualContextUrls,
   processingJob,
   profiles,
   profileSampleTargetId,
@@ -381,6 +420,18 @@ export function TranscriptView({
     words.sort((left, right) => left.startMs - right.startMs);
     return words;
   }, [turns]);
+  const visualEvidenceBySpeaker = useMemo(() => {
+    const turnSpeakerIds = new Map(
+      turns.map((turn) => [turn.id, turn.speakerId]),
+    );
+    const evidence = new Map<string, VisualContextEvent>();
+    for (const event of visualContext) {
+      if (event.kind !== "speaker_evidence") continue;
+      const speakerId = event.speakerId ?? turnSpeakerIds.get(event.turnId);
+      if (speakerId && !evidence.has(speakerId)) evidence.set(speakerId, event);
+    }
+    return evidence;
+  }, [turns, visualContext]);
   const positionActiveWordId = useMemo(
     () => findActiveWordId(wordTimeline, position),
     [position, wordTimeline],
@@ -813,6 +864,32 @@ export function TranscriptView({
           aria-label="Transcript"
           ref={transcriptScrollRef}
         >
+          {screenSourceUrl ? (
+            <section
+              className="screen-recording-card"
+              aria-labelledby="screen-recording-title"
+            >
+              <div className="screen-recording-card__heading">
+                <span className="screen-recording-card__icon" aria-hidden="true">
+                  <Monitor size={19} strokeWidth={1.8} />
+                </span>
+                <span>
+                  <h2 id="screen-recording-title">Screen recording</h2>
+                  <p>All connected displays · saved locally</p>
+                </span>
+              </div>
+              <video
+                className="screen-recording-card__video"
+                src={screenSourceUrl}
+                controls
+                preload="metadata"
+                playsInline
+                aria-label={`Screen recording for ${meeting.title}`}
+              >
+                Screen recording playback is not supported on this device.
+              </video>
+            </section>
+          ) : null}
           <TranscriptRows
             turns={turns}
             speakers={speakers}
@@ -822,6 +899,8 @@ export function TranscriptView({
             activeTurnId={activeTurnId}
             activeWordId={activeWordId}
             playbackPositionMs={position}
+            visualContext={visualContext}
+            visualContextUrls={visualContextUrls}
             onSelectTurn={(turnId) => {
               setSelectedTurn(turnId);
               const turn = turns.find((candidate) => candidate.id === turnId);
@@ -894,6 +973,7 @@ export function TranscriptView({
               suggestedProfileName={
                 profiles.find((profile) => profile.id === speaker.profileId)?.name
               }
+              visualEvidence={visualEvidenceBySpeaker.get(speaker.id)}
               onRename={(name) => onRenameSpeaker(speaker.id, name)}
               onMerge={(targetId) => onMergeSpeaker(speaker.id, targetId)}
               onAcceptReview={() => onReviewSpeaker(speaker.id, true)}

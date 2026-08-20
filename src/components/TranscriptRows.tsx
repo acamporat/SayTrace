@@ -1,7 +1,11 @@
 import { Bookmark, MessageSquare, MoreVertical } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { formatDuration } from "../lib/format";
-import type { MeetingSpeaker, TranscriptTurn } from "../types";
+import type {
+  MeetingSpeaker,
+  TranscriptTurn,
+  VisualContextEvent,
+} from "../types";
 import { SpeakerAvatar } from "./SpeakerAvatar";
 
 interface TranscriptRowsProps {
@@ -13,10 +17,61 @@ interface TranscriptRowsProps {
   activeTurnId?: string;
   activeWordId?: string;
   playbackPositionMs?: number;
+  visualContext?: VisualContextEvent[];
+  visualContextUrls?: Readonly<Record<string, string>>;
   onSelectTurn?: (turnId: string) => void;
   onEdit?: (turnId: string, editedText: string) => void;
   onToggleMarker?: (turnId: string) => void;
   onToggleReview?: (turnId: string) => void;
+}
+
+const EMPTY_VISUAL_CONTEXT: VisualContextEvent[] = [];
+const EMPTY_VISUAL_CONTEXT_URLS: Readonly<Record<string, string>> = {};
+
+function VisualContextFigure({
+  event,
+  screenshotUrl,
+}: {
+  event: VisualContextEvent;
+  screenshotUrl?: string;
+}) {
+  const sourceLabel = event.meetingSystem || "recorded desktop";
+  const alt = `Screen context captured from ${sourceLabel} at ${formatDuration(
+    event.atMs,
+  )}`;
+  return (
+    <figure
+      className="visual-context-card"
+      data-visual-context-id={event.id}
+      onClick={(clickEvent) => clickEvent.stopPropagation()}
+    >
+      {screenshotUrl ? (
+        <img
+          src={screenshotUrl}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+        />
+      ) : (
+        <div className="visual-context-card__unavailable" role="img" aria-label={alt}>
+          Screen context image unavailable
+        </div>
+      )}
+      <figcaption>
+        <span>
+          <strong>Screen context</strong>
+          <small>{sourceLabel}</small>
+        </span>
+        <time dateTime={`PT${Math.max(0, Math.round(event.atMs / 1_000))}S`}>
+          {formatDuration(event.atMs)}
+        </time>
+      </figcaption>
+      <p>{event.reason}</p>
+      {event.triggerText ? (
+        <blockquote>“{event.triggerText}”</blockquote>
+      ) : null}
+    </figure>
+  );
 }
 
 function HighlightedText({ text, query }: { text: string; query?: string }) {
@@ -187,18 +242,33 @@ export function TranscriptRows({
   activeTurnId,
   activeWordId,
   playbackPositionMs,
+  visualContext = EMPTY_VISUAL_CONTEXT,
+  visualContextUrls = EMPTY_VISUAL_CONTEXT_URLS,
   onSelectTurn,
   onEdit,
   onToggleMarker,
   onToggleReview,
 }: TranscriptRowsProps) {
   const [openTurnMenu, setOpenTurnMenu] = useState<string>();
+  const speakerById = useMemo(
+    () => new Map(speakers.map((speaker) => [speaker.id, speaker])),
+    [speakers],
+  );
+  const visualContextByTurn = useMemo(() => {
+    const grouped = new Map<string, VisualContextEvent[]>();
+    for (const event of visualContext) {
+      const current = grouped.get(event.turnId);
+      if (current) current.push(event);
+      else grouped.set(event.turnId, [event]);
+    }
+    return grouped;
+  }, [visualContext]);
 
   return (
     <div className="transcript-rows">
       {turns.map((turn) => {
         const speaker =
-          speakers.find((candidate) => candidate.id === turn.speakerId) ??
+          (turn.speakerId ? speakerById.get(turn.speakerId) : undefined) ??
           speakers[0] ?? {
             id: turn.speakerId ?? "unknown",
             displayName:
@@ -216,6 +286,17 @@ export function TranscriptRows({
           turn.editedText == null || turn.editedText === turn.modelText
             ? turn.words
             : undefined;
+        const turnVisualContext = visualContextByTurn.get(turn.id) ?? [];
+        const visualSpeakerEvidence = turnVisualContext.find(
+          (event) => event.kind === "speaker_evidence",
+        );
+        const visualAttribution =
+          visualSpeakerEvidence || speaker.attributionSource?.startsWith("visual")
+            ? speaker.attributionSource === "visual_confirmed" ||
+              speaker.attributionConfidence === "confirmed"
+              ? "Visual cue confirmed"
+              : "Visual suggestion"
+            : undefined;
         return (
           <article
             key={turn.id}
@@ -231,7 +312,24 @@ export function TranscriptRows({
             <time>{formatDuration(turn.startMs)}</time>
             <SpeakerAvatar initials={speaker.initials} color={speaker.color} />
             <div className="transcript-row__content">
-              <strong>{speaker.displayName}</strong>
+              <div className="transcript-row__speaker-line">
+                <strong>{speaker.displayName}</strong>
+                {visualAttribution ? (
+                  <span
+                    className={`visual-attribution-badge${
+                      visualAttribution === "Visual suggestion"
+                        ? " is-review"
+                        : " is-confirmed"
+                    }`}
+                    title={
+                      visualSpeakerEvidence?.reason ??
+                      "Speaker attribution includes local visual context."
+                    }
+                  >
+                    {visualAttribution}
+                  </span>
+                ) : null}
+              </div>
               {editable ? (
                 <div
                   className="transcript-row__editor"
@@ -275,6 +373,23 @@ export function TranscriptRows({
                   ) : null}
                 </p>
               )}
+              {turnVisualContext
+                .filter(
+                  (event) =>
+                    event.kind !== "speaker_evidence" &&
+                    Boolean(event.screenshotAssetId),
+                )
+                .map((event) => (
+                  <VisualContextFigure
+                    key={event.id}
+                    event={event}
+                    screenshotUrl={
+                      event.screenshotAssetId
+                        ? visualContextUrls[event.screenshotAssetId]
+                        : undefined
+                    }
+                  />
+                ))}
             </div>
             {editable ? (
               <div className="transcript-row__actions">

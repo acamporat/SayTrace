@@ -47,6 +47,9 @@ export interface RecordingConfig {
   captureSystemAudio: boolean;
   liveCaptions: boolean;
   microphoneIsPersonal: boolean;
+  captureScreen: boolean;
+  autoScreenshots: boolean;
+  visualSpeakerAttribution: boolean;
 }
 
 export interface RecordingSession {
@@ -77,6 +80,23 @@ export interface TranscriptTurn {
   needsReview?: boolean;
   revision?: number;
   words?: WordTiming[];
+}
+
+export interface VisualContextEvent {
+  id: string;
+  meetingId: string;
+  turnId: string;
+  kind: "shared_content" | "important_moment" | "speaker_evidence";
+  atMs: number;
+  screenshotAssetId?: string;
+  reason: string;
+  triggerText?: string;
+  confidence: "high" | "review";
+  source: "transcript_heuristic" | "local_vision" | string;
+  speakerId?: string;
+  suggestedSpeakerName?: string;
+  meetingSystem?: string;
+  createdAtMs: number;
 }
 
 export interface TranscriptCitation {
@@ -121,6 +141,16 @@ export interface MeetingSpeaker {
   initials: string;
   state: SpeakerState;
   profileId?: string;
+  attributionSource?:
+    | "unknown"
+    | "voice"
+    | "voice_confirmed"
+    | "visual"
+    | "visual_confirmed"
+    | "user"
+    | "isolated_source"
+    | string;
+  attributionConfidence?: "high" | "review" | "confirmed" | string;
 }
 
 export interface VoiceProfile {
@@ -179,6 +209,7 @@ export interface MeetingDetail {
   speakers: MeetingSpeaker[];
   turns: TranscriptTurn[];
   markers: Marker[];
+  visualContext: VisualContextEvent[];
 }
 
 export interface ModelPackStatus {
@@ -235,6 +266,7 @@ export interface RecordingStatus {
   elapsedMs: number;
   microphoneActive: boolean;
   systemAudioActive: boolean;
+  screenCaptureActive: boolean;
   microphoneLevel: number;
   systemAudioLevel: number;
   droppedCapturePackets: number;

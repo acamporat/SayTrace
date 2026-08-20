@@ -108,6 +108,7 @@ fn coordinator_loop(
     stop: Arc<AtomicBool>,
 ) {
     let worker_id = format!("desktop-{}", Uuid::now_v7());
+    let mut attempted_screen_playback_sources = BTreeMap::new();
     while !stop.load(Ordering::Relaxed) {
         match claim_next_job(&core, &worker_id) {
             Ok(Some(job)) => {
@@ -121,7 +122,73 @@ fn coordinator_loop(
                     );
                 }
             }
-            Ok(None) => thread::sleep(IDLE_POLL),
+            Ok(None) => {
+                let attempted_screen_playback =
+                    match crate::recording::backfill_next_screen_playback(
+                        &core,
+                        &attempted_screen_playback_sources,
+                    ) {
+                        Ok(Some(backfill)) => {
+                            attempted_screen_playback_sources
+                                .insert(backfill.source_asset_id.clone(), now_ms());
+                            if backfill.created() {
+                                log::info!(
+                                    "created H.264 screen playback derivative for meeting {}",
+                                    backfill.meeting_id
+                                );
+                                let _ = app.emit(
+                                    "meeting://changed",
+                                    json!({
+                                        "meetingId":backfill.meeting_id,
+                                        "reason":"screen_playback_backfilled"
+                                    }),
+                                );
+                            } else if let Some(warning) = &backfill.warning {
+                                log::warn!(
+                                    "screen playback backfill for meeting {} failed: {warning}",
+                                    backfill.meeting_id
+                                );
+                            }
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(error) => {
+                            log::warn!("screen playback backfill poll failed: {error}");
+                            false
+                        }
+                    };
+                if !attempted_screen_playback {
+                    match crate::visual_context::backfill_next_missing(&core) {
+                        Ok(Some(backfill)) => {
+                            let created_context = backfill.report.created_context();
+                            log::info!(
+                                "backfilled visual context for meeting {} with {} screen snapshots and {} visual speaker suggestions",
+                                backfill.meeting_id,
+                                backfill.report.screenshots_created,
+                                backfill.report.visual_speakers_suggested
+                            );
+                            for warning in &backfill.report.warnings {
+                                log::warn!(
+                                    "visual context backfill for meeting {}: {warning}",
+                                    backfill.meeting_id
+                                );
+                            }
+                            if created_context {
+                                let _ = app.emit(
+                                    "meeting://changed",
+                                    json!({
+                                        "meetingId":backfill.meeting_id,
+                                        "reason":"visual_context_backfilled"
+                                    }),
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => log::warn!("visual context backfill failed: {error}"),
+                    }
+                }
+                thread::sleep(IDLE_POLL);
+            }
             Err(error) => {
                 log::error!("processing queue poll failed: {error}");
                 thread::sleep(IDLE_POLL);
@@ -238,6 +305,27 @@ fn run_claimed_job(
                         CoreError::Worker("worker completion did not contain a result".into())
                     })?;
                     commit_canonical_result(core, job, result)?;
+                    match crate::visual_context::enrich_meeting(core, &job.meeting_id) {
+                        Ok(report) => {
+                            if report.screenshots_created > 0
+                                || report.visual_speakers_suggested > 0
+                            {
+                                log::info!(
+                                    "meeting {} gained {} screen snapshots and {} visual speaker suggestions",
+                                    job.meeting_id,
+                                    report.screenshots_created,
+                                    report.visual_speakers_suggested
+                                );
+                            }
+                            for warning in report.warnings {
+                                log::warn!("visual context for meeting {}: {warning}", job.meeting_id);
+                            }
+                        }
+                        Err(error) => log::warn!(
+                            "canonical transcript completed but visual context failed for meeting {}: {error}",
+                            job.meeting_id
+                        ),
+                    }
                     emit_job(core, app, &job.id);
                     let _ = app.emit(
                         "meeting://changed",
@@ -345,7 +433,9 @@ fn build_pipeline_payload(core: &CoreService, job: &ClaimedJob) -> CoreResult<Va
             });
         }
     } else {
-        assets.retain(|asset| asset.kind != "playback");
+        // Imported audio/video is validated to contain audio. Screen videos and
+        // generated snapshots are visual evidence, never ASR inputs.
+        assets.retain(|asset| matches!(asset.kind.as_str(), "audio" | "video"));
     }
     if assets.is_empty() {
         return Err(CoreError::InvalidInput(
@@ -1083,6 +1173,18 @@ fn import_turn(
     } else {
         None
     };
+    let attribution_source = if profile_id.is_some() {
+        "voice"
+    } else if cluster.starts_with("isolated:") {
+        "isolated_source"
+    } else {
+        "unknown"
+    };
+    let attribution_confidence = match (attribution_source, state) {
+        ("voice", "matched") | ("isolated_source", _) => Some("high"),
+        ("voice", "review") => Some("review"),
+        _ => None,
+    };
     let merged_target = transaction
         .query_row(
             "SELECT target_speaker_id FROM speaker_merge_rules
@@ -1101,8 +1203,9 @@ fn import_turn(
     if merged_target.is_none() {
         transaction.execute(
             "INSERT INTO meeting_speakers(
-                id,meeting_id,cluster_label,display_name,profile_id,match_state,needs_review
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+                id,meeting_id,cluster_label,display_name,profile_id,match_state,needs_review,
+                attribution_source,attribution_confidence
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(meeting_id,cluster_label) DO UPDATE SET
                 display_name=CASE
                     WHEN meeting_speakers.match_state='unknown'
@@ -1123,7 +1226,15 @@ fn import_turn(
                     WHEN meeting_speakers.match_state='unknown'
                      AND (meeting_speakers.display_name IN ('Unknown','Unknown speaker')
                           OR meeting_speakers.display_name GLOB 'Speaker [0-9]*')
-                    THEN excluded.needs_review ELSE meeting_speakers.needs_review END",
+                    THEN excluded.needs_review ELSE meeting_speakers.needs_review END,
+                attribution_source=CASE
+                    WHEN meeting_speakers.match_state='unknown'
+                     AND meeting_speakers.attribution_source='unknown'
+                    THEN excluded.attribution_source ELSE meeting_speakers.attribution_source END,
+                attribution_confidence=CASE
+                    WHEN meeting_speakers.match_state='unknown'
+                     AND meeting_speakers.attribution_source='unknown'
+                    THEN excluded.attribution_confidence ELSE meeting_speakers.attribution_confidence END",
             params![
                 deterministic_speaker_id,
                 meeting_id,
@@ -1131,7 +1242,9 @@ fn import_turn(
                 speaker_name,
                 profile_id,
                 state,
-                i64::from(needs_review)
+                i64::from(needs_review),
+                attribution_source,
+                attribution_confidence
             ],
         )?;
         if state == "matched" {

@@ -1,6 +1,6 @@
 # SayTrace
 
-SayTrace is a Windows-first desktop application for private meeting capture, audio/video transcription, and conservative speaker identification. Microphone and system audio are recorded locally as separate sources, live captions are treated as disposable drafts, and the canonical transcript is rebuilt from the saved media after recording stops.
+SayTrace is a Windows-first desktop application for private meeting capture, audio/video transcription, and conservative speaker identification. Microphone and system audio are recorded locally as separate sources, live captions are treated as disposable drafts, and the canonical transcript is rebuilt from the saved media after recording stops. An explicit per-meeting option can also record the whole desktop, extract relevant screen moments beside the final transcript, and use visible meeting UI as reviewable speaker evidence.
 
 The application does not use a cloud transcription service. It enables network
 access only during explicit model setup for the revision-pinned files declared by
@@ -43,6 +43,23 @@ model exists, setup installs the pinned `qwen3:4b` starter model. Existing local
 models are preserved. SayTrace lists only installed, non-cloud models and never
 sends transcript text to a hosted model.
 
+## Screen context
+
+Screen recording is on by default, but recording cannot start until the user
+separately acknowledges that the whole desktop across all connected displays,
+notifications, and other visible applications may be saved. The review step also
+provides a deliberate audio-only path. When enabled, SayTrace records a
+low-frame-rate local screen track alongside the audio and pauses that track
+whenever meeting capture is paused. After the final transcript is committed,
+deterministic transcript cues select a bounded set of screen moments, which are
+extracted as local JPEG assets and shown inline.
+
+The optional visual-speaker pass uses only an installed, non-cloud Ollama vision
+model. It looks for meeting-application evidence such as an active-speaker border
+or visible participant label. A name must recur across distinct transcript turns
+before it is proposed, and every proposal remains in **Review** until a person
+confirms it. Voice-confirmed and manually assigned identities are never replaced.
+
 ## Development prerequisites
 
 - Windows 11 x64
@@ -71,9 +88,11 @@ npm run dev
 
 The browser preview uses the approved demonstration meeting so visual and interaction tests are deterministic. Packaged Tauri builds do not load demonstration meetings.
 
-To run the desktop shell:
+To run the desktop shell with local transcription, install the full worker extra
+before launching Tauri. This is a multi-gigabyte local dependency set:
 
 ```powershell
+uv sync --project worker --extra ml --group dev
 npm run tauri:dev
 ```
 
@@ -109,6 +128,8 @@ uv run --project worker pytest
 The release gate also requires:
 
 - a two-hour microphone/loopback synchronization soak;
+- whole-desktop capture pause/resume, crash recovery, and long-recording playback;
+- calibrated Teams and other supported-meeting-UI visual attribution testing;
 - device removal, pause/resume, disk-full, and forced-termination recovery;
 - blocked-network final transcription;
 - calibrated speaker-name false-accept testing;
@@ -117,8 +138,10 @@ The release gate also requires:
 
 ## Privacy boundary
 
-- Audio, video, transcripts, and model files stay in the local application-data library.
+- Audio, screen video, extracted screenshots, transcripts, and model files stay in the local application-data library.
+- Whole-desktop capture across all connected displays is enabled by default but separately disclosed and blocked behind an explicit pre-recording acknowledgement; users can choose audio-only recording and should hide sensitive windows and notifications before proceeding.
 - Transcript questions are sent only to the local Ollama loopback endpoint; hosted Ollama models are excluded.
+- Visual speaker frames are sent only to a compatible installed model through that same loopback endpoint and are never used for an automatic confirmed match.
 - Voice embeddings are protected with Windows DPAPI for the current user.
 - Audio and transcript files are not separately encrypted by the application; use BitLocker for whole-library at-rest encryption.
 - The worker runs in explicit offline mode after model setup and has no listening network port.

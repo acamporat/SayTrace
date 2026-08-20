@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import previewScreenContextUrl from "../docs/design/transcript-workspace-concept.png";
 import { NewTranscriptionDialog } from "./components/NewTranscriptionDialog";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
@@ -12,6 +13,7 @@ import {
   modelStatus as seedModelStatus,
   speakers as seedSpeakers,
   transcriptTurns as seedTurns,
+  visualContext as seedVisualContext,
   voiceProfiles as seedProfiles,
 } from "./data/mock";
 import { LibraryView } from "./features/library/LibraryView";
@@ -51,11 +53,15 @@ import type {
   RecordingLevels,
   TranscriptTurn,
   TranscriptChatMessage,
+  VisualContextEvent,
   VoiceProfile,
 } from "./types";
 
 type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
 const PROFILE_READY_DURATION_MS = 10_000;
+const PREVIEW_VISUAL_CONTEXT_URLS: Record<string, string> = {
+  "preview-shared-screen": previewScreenContextUrl,
+};
 
 function safeMeetingStatus(
   meeting: Meeting,
@@ -105,6 +111,10 @@ function errorMessage(error: unknown, fallback: string) {
   }
   if (typeof error === "string" && error.trim()) return error;
   return fallback;
+}
+
+function revokeBlobUrl(url?: string) {
+  if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
 }
 
 function transcriptText(
@@ -183,6 +193,7 @@ export default function App() {
     elapsedMs: 0,
     microphoneActive: !desktopRuntime,
     systemAudioActive: !desktopRuntime,
+    screenCaptureActive: false,
     microphoneLevel: 0,
     systemAudioLevel: 0,
     droppedCapturePackets: 0,
@@ -201,7 +212,16 @@ export default function App() {
     outputDeviceId: "",
     microphoneIsPersonal: true,
     liveCaptions: true,
+    captureScreen: false,
+    autoScreenshots: false,
+    visualSpeakerAttribution: false,
   });
+  const [visualContext, setVisualContext] = useState<VisualContextEvent[]>(
+    desktopRuntime ? [] : seedVisualContext,
+  );
+  const [visualContextUrls, setVisualContextUrls] = useState<
+    Record<string, string>
+  >(desktopRuntime ? {} : PREVIEW_VISUAL_CONTEXT_URLS);
   const [meetingRefreshToken, setMeetingRefreshToken] = useState(0);
   const [jobs, setJobs] = useState<ProcessingJob[]>([]);
   const [workerStatus, setWorkerStatus] = useState<AppStatus["worker"]>({
@@ -210,6 +230,7 @@ export default function App() {
     pipelineVersion: "2026.07.28.1",
   });
   const [mediaUrl, setMediaUrl] = useState<string>();
+  const [screenMediaUrl, setScreenMediaUrl] = useState<string>();
   const [newDialogOpen, setNewDialogOpen] = useState(false);
   const [profileSampleTargetId, setProfileSampleTargetId] =
     useState<string>();
@@ -331,18 +352,23 @@ export default function App() {
         const microphoneFailed = event.deviceId === "microphone";
         const systemFailed =
           event.deviceId === "loopback" || event.deviceId === "system";
+        const screenFailed = event.deviceId === "screen";
         const microphoneActive = microphoneFailed
           ? false
           : current.microphoneActive;
         const systemAudioActive = systemFailed
           ? false
           : current.systemAudioActive;
+        const screenCaptureActive = screenFailed
+          ? false
+          : current.screenCaptureActive;
         return {
           ...current,
           state:
             !microphoneActive && !systemAudioActive ? "failed" : current.state,
           microphoneActive,
           systemAudioActive,
+          screenCaptureActive,
           warning: event.message,
         };
       });
@@ -410,17 +436,26 @@ export default function App() {
   useEffect(() => {
     if (!desktopRuntime || view.kind !== "transcript") {
       setMediaUrl((current) => {
-        if (current) URL.revokeObjectURL(current);
+        revokeBlobUrl(current);
+        return undefined;
+      });
+      setScreenMediaUrl((current) => {
+        revokeBlobUrl(current);
         return undefined;
       });
       return;
     }
     let alive = true;
-    let objectUrl: string | undefined;
+    let playbackObjectUrl: string | undefined;
+    let screenObjectUrl: string | undefined;
+    const contextObjectUrls: string[] = [];
     setTurns([]);
     setSpeakers([]);
     setMarkers([]);
+    setVisualContext([]);
+    setVisualContextUrls({});
     setMediaUrl(undefined);
+    setScreenMediaUrl(undefined);
     void invokeCommand("get_meeting", { meetingId: view.meetingId })
       .then(async (detail) => {
         if (!alive) return;
@@ -433,6 +468,8 @@ export default function App() {
         setTurns(detail.turns);
         setSpeakers(normalizeSpeakers(detail.speakers));
         setMarkers(detail.markers);
+        const nextVisualContext = detail.visualContext ?? [];
+        setVisualContext(nextVisualContext);
         const preferredAsset =
           detail.assets.find(
             (asset) => asset.kind === "playback" || asset.kind === "mixed",
@@ -443,18 +480,64 @@ export default function App() {
               asset.contentType?.startsWith("audio/"),
           ) ??
           detail.assets[0];
-        if (preferredAsset) {
-          try {
-            objectUrl = await createAssetObjectUrl(preferredAsset.id);
-            if (alive) setMediaUrl(objectUrl);
-          } catch {
-            if (alive) {
-              notify(
-                "Playback media is unavailable while processing continues.",
-                "info",
-              );
-            }
-          }
+        const screenAsset =
+          detail.assets.find((asset) => asset.kind === "screen_playback") ??
+          detail.assets.find((asset) => asset.kind === "screen");
+        const screenshotAssetIds = Array.from(
+          new Set(
+            nextVisualContext
+              .map((event) => event.screenshotAssetId)
+              .filter((assetId): assetId is string => Boolean(assetId)),
+          ),
+        );
+        const [playbackUrl, screenUrl, screenshotEntries] = await Promise.all([
+          preferredAsset
+            ? createAssetObjectUrl(preferredAsset.id).catch(() => undefined)
+            : Promise.resolve(undefined),
+          screenAsset
+            ? createAssetObjectUrl(screenAsset.id).catch(() => undefined)
+            : Promise.resolve(undefined),
+          Promise.all(
+            screenshotAssetIds.map(async (assetId) => {
+              try {
+                const url = await createAssetObjectUrl(assetId);
+                if (url.startsWith("blob:")) contextObjectUrls.push(url);
+                return [assetId, url] as const;
+              } catch {
+                return undefined;
+              }
+            }),
+          ),
+        ]);
+        playbackObjectUrl = playbackUrl;
+        screenObjectUrl = screenUrl;
+        if (!alive) {
+          revokeBlobUrl(playbackUrl);
+          revokeBlobUrl(screenUrl);
+          contextObjectUrls.forEach(revokeBlobUrl);
+          contextObjectUrls.length = 0;
+          return;
+        }
+        setMediaUrl(playbackUrl);
+        setScreenMediaUrl(screenUrl);
+        setVisualContextUrls(
+          Object.fromEntries(
+            screenshotEntries.filter(
+              (entry): entry is readonly [string, string] => Boolean(entry),
+            ),
+          ),
+        );
+        if (preferredAsset && !playbackUrl) {
+          notify(
+            "Playback media is unavailable while processing continues.",
+            "info",
+          );
+        }
+        if (screenAsset && !screenUrl) {
+          notify(
+            "The saved screen recording is unavailable while processing continues.",
+            "info",
+          );
         }
       })
       .catch(() => {
@@ -462,7 +545,9 @@ export default function App() {
       });
     return () => {
       alive = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      revokeBlobUrl(playbackObjectUrl);
+      revokeBlobUrl(screenObjectUrl);
+      contextObjectUrls.forEach(revokeBlobUrl);
     };
   }, [desktopRuntime, meetingRefreshToken, view]);
 
@@ -518,7 +603,9 @@ export default function App() {
         ...current.filter((candidate) => candidate.id !== meeting.id),
       ]);
       setView({ kind: "transcript", meetingId: meeting.id });
-      notify("Media copied into your local library.");
+      notify(
+        "Media copied locally. Recorded video will be analyzed for inline screenshots and visual speaker cues; audio-only files remain transcript-only.",
+      );
     } catch (error) {
       notify(
         error instanceof Error ? error.message : "Could not import this media.",
@@ -541,8 +628,15 @@ export default function App() {
       assetId: `browser-${id}`,
     };
     setMeetings((current) => [meeting, ...current]);
+    setVisualContext([]);
+    setVisualContextUrls({});
     setView({ kind: "transcript", meetingId: id });
-    notify(`${file.name} added to the browser preview.`, "info");
+    notify(
+      file.type.startsWith("video/")
+        ? `${file.name} added. Recorded video will be analyzed locally for inline screenshots and visual speaker cues.`
+        : `${file.name} added. Audio-only imports produce a transcript without screen screenshots or visual speaker cues.`,
+      "info",
+    );
   }
 
   async function startRecording(
@@ -550,6 +644,9 @@ export default function App() {
     requestedOutputId?: string,
     microphoneIsPersonal = true,
     liveCaptions = true,
+    captureScreen = false,
+    autoScreenshots = false,
+    visualSpeakerAttribution = false,
   ) {
     setNewDialogOpen(false);
     const microphone =
@@ -582,6 +679,10 @@ export default function App() {
       outputDeviceId: output?.id ?? "",
       microphoneIsPersonal,
       liveCaptions,
+      captureScreen,
+      autoScreenshots: captureScreen && autoScreenshots,
+      visualSpeakerAttribution:
+        captureScreen && visualSpeakerAttribution,
     });
     const id = `recording-${Date.now()}`;
     let nextMeeting: Meeting = {
@@ -604,6 +705,10 @@ export default function App() {
             captureSystemAudio: true,
             liveCaptions,
             microphoneIsPersonal,
+            captureScreen,
+            autoScreenshots: captureScreen && autoScreenshots,
+            visualSpeakerAttribution:
+              captureScreen && visualSpeakerAttribution,
           },
         });
         nextMeeting = {
@@ -620,6 +725,7 @@ export default function App() {
           elapsedMs: session.elapsedMs,
           microphoneActive: true,
           systemAudioActive: true,
+          screenCaptureActive: captureScreen,
           microphoneLevel: 0,
           systemAudioLevel: 0,
           droppedCapturePackets: 0,
@@ -635,6 +741,8 @@ export default function App() {
     }
     setMeetings((current) => [nextMeeting, ...current]);
     setMarkers(desktopRuntime ? [] : seedMarkers);
+    setVisualContext([]);
+    setVisualContextUrls({});
     setLiveDraftTurns([]);
     setLiveDraftSpeakers([]);
     if (!desktopRuntime) {
@@ -654,6 +762,7 @@ export default function App() {
         elapsedMs: previewSession.elapsedMs,
         microphoneActive: true,
         systemAudioActive: true,
+        screenCaptureActive: captureScreen,
         microphoneLevel: recordingLevels.microphone,
         systemAudioLevel: recordingLevels.system,
         droppedCapturePackets: 0,
@@ -661,7 +770,11 @@ export default function App() {
       });
     }
     setView({ kind: "recording", meetingId: nextMeeting.id });
-    notify("Recording started. Audio is being saved locally.");
+    notify(
+      captureScreen
+        ? "Recording started. Audio and all connected displays are being saved locally."
+        : "Recording started. Audio is being saved locally.",
+    );
   }
 
   async function toggleRecordingPause() {
@@ -733,6 +846,15 @@ export default function App() {
       );
       setTurns(seedTurns);
       setSpeakers(seedSpeakers);
+      setVisualContext(
+        seedVisualContext.filter((event) =>
+          event.kind === "speaker_evidence"
+            ? recordingDevices.captureScreen &&
+              recordingDevices.visualSpeakerAttribution
+            : recordingDevices.captureScreen && recordingDevices.autoScreenshots,
+        ),
+      );
+      setVisualContextUrls(PREVIEW_VISUAL_CONTEXT_URLS);
     }
     setRecordingSession(undefined);
     recordingSessionRef.current = undefined;
@@ -741,6 +863,7 @@ export default function App() {
       state: "stopped",
       microphoneActive: false,
       systemAudioActive: false,
+      screenCaptureActive: false,
       microphoneLevel: 0,
       systemAudioLevel: 0,
     }));
@@ -749,6 +872,9 @@ export default function App() {
       outputDeviceId: "",
       microphoneIsPersonal: true,
       liveCaptions: true,
+      captureScreen: false,
+      autoScreenshots: false,
+      visualSpeakerAttribution: false,
     });
     setLiveDraftTurns([]);
     setLiveDraftSpeakers([]);
@@ -1086,7 +1212,14 @@ export default function App() {
     const matchedProfile = previousSpeaker.profileId
       ? profiles.find((profile) => profile.id === previousSpeaker.profileId)
       : undefined;
-    if (accepted && !matchedProfile) {
+    const visualSuggestion = previousSpeaker.attributionSource === "visual";
+    const visualSuggestionName = visualContext.find(
+      (event) =>
+        event.kind === "speaker_evidence" && event.speakerId === speakerId,
+    )?.suggestedSpeakerName;
+    const acceptedName =
+      matchedProfile?.name ?? visualSuggestionName ?? previousSpeaker.displayName;
+    if (accepted && !matchedProfile && !visualSuggestion) {
       notify("This review item has no saved profile suggestion.", "warning");
       return;
     }
@@ -1097,8 +1230,18 @@ export default function App() {
             ? {
                 ...speaker,
                 state: "Matched",
-                displayName: matchedProfile?.name ?? speaker.displayName,
-                initials: matchedProfile?.initials ?? speaker.initials,
+                displayName: acceptedName,
+                initials:
+                  matchedProfile?.initials ??
+                  acceptedName
+                    .split(/\s+/)
+                    .slice(0, 2)
+                    .map((part) => part[0]?.toUpperCase())
+                    .join(""),
+                attributionSource: visualSuggestion
+                  ? "visual_confirmed"
+                  : "voice_confirmed",
+                attributionConfidence: "confirmed",
               }
             : {
                 ...speaker,
@@ -1106,6 +1249,8 @@ export default function App() {
                 displayName: defaultSpeakerName,
                 profileId: undefined,
                 initials: `S${defaultSpeakerName.replace(/\D/g, "")}`,
+                attributionSource: "unknown",
+                attributionConfidence: undefined,
               }
           : speaker,
       ),
@@ -1126,7 +1271,7 @@ export default function App() {
     }
     notify(
       accepted
-        ? `Speaker matched to ${matchedProfile?.name}.`
+        ? `Speaker matched to ${acceptedName}.`
         : `Match removed. This speaker will remain ${defaultSpeakerName}.`,
       "info",
     );
@@ -1602,6 +1747,11 @@ export default function App() {
           outputDeviceId={recordingDevices.outputDeviceId}
           microphoneIsPersonal={recordingDevices.microphoneIsPersonal}
           liveCaptionsEnabled={recordingDevices.liveCaptions}
+          captureScreen={recordingDevices.captureScreen}
+          autoScreenshots={recordingDevices.autoScreenshots}
+          visualSpeakerAttribution={
+            recordingDevices.visualSpeakerAttribution
+          }
           availableStorageGb={modelStatus.diskAvailableGb}
           onRenameMeeting={renameMeeting}
           onTogglePause={() => void toggleRecordingPause()}
@@ -1614,10 +1764,13 @@ export default function App() {
       <TranscriptView
         meeting={selectedMeeting}
         mediaSourceUrl={mediaUrl}
+        screenSourceUrl={screenMediaUrl}
         allowSimulatedPlayback={!desktopRuntime}
         turns={turns}
         speakers={speakers}
         markers={markers}
+        visualContext={visualContext}
+        visualContextUrls={visualContextUrls}
         processingJob={jobs.find(
           (job) => job.meetingId === selectedMeeting.id,
         )}
@@ -1677,12 +1830,18 @@ export default function App() {
             outputDeviceId,
             microphoneIsPersonal,
             liveCaptions,
+            captureScreen,
+            autoScreenshots,
+            visualSpeakerAttribution,
           ) =>
             void startRecording(
               microphoneDeviceId,
               outputDeviceId,
               microphoneIsPersonal,
               liveCaptions,
+              captureScreen,
+              autoScreenshots,
+              visualSpeakerAttribution,
             )
           }
         />
