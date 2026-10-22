@@ -10,13 +10,16 @@ import {
 import { memo, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { formatDuration } from "../../lib/format";
+import { invokeCommand, isTauriRuntime, openExternalUrl } from "../../lib/tauri";
 import type {
+  ChatGptAgentStatus,
   LocalAgentStatus,
   TranscriptChatMessage,
   TranscriptCitation,
 } from "../../types";
 
 interface TranscriptAssistantPanelProps {
+  meetingId?: string;
   meetingTitle: string;
   messages: TranscriptChatMessage[];
   status: LocalAgentStatus;
@@ -24,7 +27,7 @@ interface TranscriptAssistantPanelProps {
   error?: string;
   transcriptReady: boolean;
   onOpenSpeakers: () => void;
-  onAsk: (question: string, model?: string) => Promise<void>;
+  onAsk: (question: string, model?: string, provider?: "local" | "chatgpt", cloudConsent?: boolean) => Promise<void>;
   onClear: () => Promise<void>;
   onRefreshStatus: () => Promise<void>;
   onOpenCitation: (citation: TranscriptCitation) => void;
@@ -115,6 +118,7 @@ const AssistantAnswer = memo(function AssistantAnswer({ content }: { content: st
 });
 
 export function TranscriptAssistantPanel({
+  meetingId,
   meetingTitle,
   messages,
   status,
@@ -129,8 +133,67 @@ export function TranscriptAssistantPanel({
 }: TranscriptAssistantPanelProps) {
   const [draft, setDraft] = useState("");
   const [model, setModel] = useState(status.selectedModel ?? "");
+  const [provider, setProvider] = useState<"local" | "chatgpt">("local");
+  const [cloudConsent, setCloudConsent] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState<ChatGptAgentStatus>({ available: false, signedIn: false, models: [] });
+  const [cloudModel, setCloudModel] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authPending, setAuthPending] = useState(false);
+  const [authError, setAuthError] = useState<string>();
   const scrollRef = useRef<HTMLDivElement>(null);
   const latestMessageRef = useRef<HTMLElement>(null);
+
+  useEffect(() => { setCloudConsent(false); }, [meetingId, meetingTitle, provider]);
+
+  async function refreshCloudStatus() {
+    if (!isTauriRuntime()) {
+      setAuthError("ChatGPT sign-in is available in the installed desktop app.");
+      return;
+    }
+    try {
+      const next = await invokeCommand("get_chatgpt_agent_status");
+      setCloudStatus(next);
+      setAuthError(next.error);
+      if (next.signedIn) setAuthPending(false);
+      setCloudModel((current) => next.models.some((item) => item.id === current) ? current : next.models[0]?.id ?? "");
+    } catch (cause) {
+      setAuthError(cause instanceof Error ? cause.message : "ChatGPT status could not be checked.");
+    }
+  }
+
+  useEffect(() => {
+    if (provider !== "chatgpt") return;
+    void refreshCloudStatus();
+    if (!authPending) return;
+    const timer = window.setInterval(() => void refreshCloudStatus(), 5000);
+    const timeout = window.setTimeout(() => setAuthPending(false), 180000);
+    return () => { window.clearInterval(timer); window.clearTimeout(timeout); };
+  }, [provider, authPending]);
+
+  async function signIn() {
+    setAuthBusy(true);
+    setAuthError(undefined);
+    try {
+      const url = await invokeCommand("sign_in_chatgpt");
+      await openExternalUrl(url);
+      setAuthPending(true);
+    } catch (cause) {
+      setAuthError(cause instanceof Error ? cause.message : "ChatGPT sign-in could not start.");
+    } finally { setAuthBusy(false); }
+  }
+
+  async function signOut() {
+    setAuthBusy(true);
+    setCloudConsent(false);
+    setAuthPending(false);
+    try {
+      await invokeCommand("sign_out_chatgpt");
+      setCloudStatus({ available: true, signedIn: false, models: [] });
+      setCloudModel("");
+    } catch (cause) {
+      setAuthError(cause instanceof Error ? cause.message : "ChatGPT sign-out failed.");
+    } finally { setAuthBusy(false); }
+  }
 
   useEffect(() => {
     if (!status.models.some((candidate) => candidate.name === model)) {
@@ -164,13 +227,15 @@ export function TranscriptAssistantPanel({
   }, [loading, messages]);
 
   const canAsk =
-    transcriptReady && status.state === "ready" && Boolean(model) && !loading;
+    transcriptReady && !loading && (provider === "local"
+      ? status.state === "ready" && Boolean(model)
+      : cloudStatus.available && cloudStatus.signedIn && Boolean(cloudModel) && cloudConsent && !authBusy);
 
   async function submit(question: string) {
     const value = question.trim();
     if (!value || !canAsk) return;
     setDraft("");
-    await onAsk(value, model);
+    await onAsk(value, provider === "local" ? model : cloudModel, provider, provider === "chatgpt" && cloudConsent);
   }
 
   return (
@@ -193,7 +258,7 @@ export function TranscriptAssistantPanel({
           <span>
             <h2>Ask this transcript</h2>
             <small>
-              <LockKeyhole size={11} /> Runs locally on this device
+              <LockKeyhole size={11} /> {provider === "local" ? "Runs locally on this device" : "Uses your ChatGPT account through Codex"}
             </small>
           </span>
           {messages.length ? (
@@ -211,6 +276,31 @@ export function TranscriptAssistantPanel({
         </header>
 
         <div className="assistant-panel__scroll" ref={scrollRef}>
+        <div className="assistant-provider">
+          <label htmlFor="assistant-provider">Answer with</label>
+          <select id="assistant-provider" value={provider} disabled={loading || authBusy}
+            onChange={(event) => setProvider(event.target.value as "local" | "chatgpt")}>
+            <option value="local">Local AI · On this device</option>
+            <option value="chatgpt">ChatGPT · Codex usage</option>
+          </select>
+          {provider === "chatgpt" ? <>
+            <p>Uses your available Codex plan usage or credits. Limits still apply. Questions, relevant transcript excerpts, speaker names, and conversation history are sent to OpenAI. Audio and video stay local.</p>
+            {cloudStatus.signedIn ? <>
+              <small>Connected{cloudStatus.email ? ` as ${cloudStatus.email}` : ""}{cloudStatus.planType ? ` · ${cloudStatus.planType}` : ""}</small>
+              <button type="button" disabled={loading || authBusy} onClick={() => void signOut()}>Sign out</button>
+            </> : <button type="button" disabled={loading || authBusy || authPending || !isTauriRuntime()} onClick={() => void signIn()}>
+              {authPending ? "Finish sign-in in your browser…" : authBusy ? "Opening sign-in…" : "Continue with ChatGPT"}
+            </button>}
+            <label className="assistant-cloud-consent">
+              <input type="checkbox" checked={cloudConsent} disabled={loading || !cloudStatus.signedIn}
+                onChange={(event) => setCloudConsent(event.target.checked)} />
+              Allow meeting text to be sent to OpenAI for these questions
+            </label>
+            {authError ? <p role="alert">{authError}</p> : null}
+            <button type="button" disabled={authBusy || loading} onClick={() => void refreshCloudStatus()}>Refresh ChatGPT status</button>
+          </> : null}
+        </div>
+
           <div className="assistant-welcome">
             <Sparkles size={18} />
             <p>
@@ -248,7 +338,7 @@ export function TranscriptAssistantPanel({
                 ) : null}
                 <div>
                   {message.role === "assistant" ? (
-                    <AssistantAnswer content={message.content} />
+                    <><small className="assistant-message__provider">{message.model?.startsWith("chatgpt:") ? "ChatGPT · Codex" : "Local AI"}</small><AssistantAnswer content={message.content} /></>
                   ) : (
                     <p>{message.content}</p>
                   )}
@@ -275,7 +365,7 @@ export function TranscriptAssistantPanel({
                   <Bot size={15} />
                 </span>
                 <div>
-                  <p>Thinking locally</p>
+                  <p>{provider === "local" ? "Thinking locally" : "Asking ChatGPT"}</p>
                   <span aria-hidden="true"><i /><i /><i /></span>
                 </div>
               </article>
@@ -287,7 +377,7 @@ export function TranscriptAssistantPanel({
             <div className="assistant-unavailable">
               Finish processing this meeting before asking questions.
             </div>
-          ) : status.state !== "ready" ? (
+          ) : provider === "local" && status.state !== "ready" ? (
             <div className="assistant-unavailable">
               {status.state === "checking"
                 ? "Checking the local AI runtime…"
@@ -332,9 +422,13 @@ export function TranscriptAssistantPanel({
           </button>
         </form>
 
-        <div className={`assistant-model assistant-model--${status.state}`}>
+        <div className={`assistant-model assistant-model--${provider === "local" ? status.state : cloudStatus.signedIn ? "ready" : "unavailable"}`}>
           <span aria-hidden="true" />
-          {status.models.length ? (
+          {provider === "chatgpt" ? <select aria-label="ChatGPT model" value={cloudModel} disabled={loading || !cloudStatus.signedIn}
+            onChange={(event) => setCloudModel(event.target.value)}>
+            {!cloudStatus.models.length ? <option value="">Sign in to see models</option> : null}
+            {cloudStatus.models.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.displayName} · ChatGPT</option>)}
+          </select> : status.models.length ? (
             <select
               aria-label="Local AI model"
               value={model}
@@ -352,9 +446,9 @@ export function TranscriptAssistantPanel({
           )}
           <button
             type="button"
-            aria-label="Refresh local AI status"
-            title="Refresh local AI status"
-            onClick={() => void onRefreshStatus()}
+            aria-label="Refresh AI status"
+            title="Refresh AI status"
+            onClick={() => void (provider === "local" ? onRefreshStatus() : refreshCloudStatus())}
           >
             <RefreshCw size={14} />
           </button>

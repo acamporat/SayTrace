@@ -95,6 +95,58 @@ class FakeEmbedder:
         return SpeakerEmbeddingBatch(((1.0, 0.0),), 1_000)
 
 
+class FragmentTranscriber(FakeTranscriber):
+    def transcribe(
+        self, audio_path: Path, source_id: str, cancel: threading.Event
+    ) -> list[WordTiming]:
+        self.calls += 1
+        return [WordTiming("fragment-word", "hello", 150, 950, source_id)]
+
+
+class FragmentDiarizer:
+    def diarize(self, audio_path: Path, cancel: threading.Event) -> list[DiarizationSegment]:
+        return [
+            DiarizationSegment(0, 400, "a"),
+            DiarizationSegment(400, 700, "b"),
+            DiarizationSegment(700, 2000, "a"),
+        ]
+
+
+def test_final_fragment_review_is_applied_after_resume(tmp_path: Path) -> None:
+    source = tmp_path / "source.wav"
+    source.write_bytes(b"fake-wave")
+    transcriber = FragmentTranscriber()
+    pipeline = FinalPipeline(
+        normalizer=FakeNormalizer(),
+        transcriber=transcriber,
+        aligner=FakeAligner(),
+        diarizer=FragmentDiarizer(),
+        embedder=None,
+        emit=lambda _event, _payload: None,
+        correlation_factory=lambda paths: lambda left, right: None,
+    )
+    request = PipelineInput(
+        job_id="fragment-review",
+        pipeline_version="pipeline-1",
+        sources=(SourceAsset("asset-1", source, "import"),),
+        workspace=tmp_path / "job",
+        diarization_asset_id="asset-1",
+        profiles=(),
+        match_policy=None,
+        checkpoint=PipelineCheckpoint("pipeline-1"),
+    )
+    for _ in range(2):
+        result = pipeline.run(request, threading.Event())
+        canonical = json.loads(Path(str(result["canonical_artifact_path"])).read_text())
+        assert canonical["turns"][0]["speaker_cluster_id"] == "a"
+        assert canonical["warnings"][0]["code"] == "SPEAKER_FRAGMENT_REPAIRED"
+        raw_merge = json.loads(
+            Path(request.checkpoint.stage_results["merge:all-sources"]).read_text()
+        )
+        assert raw_merge["words"][0]["speaker_cluster_id"] == "b"
+    assert transcriber.calls == 1
+
+
 class FakeEmptyEmbedder:
     def embed_intervals(
         self,

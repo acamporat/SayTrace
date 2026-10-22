@@ -184,4 +184,64 @@ describe("TranscriptRows playback alignment", () => {
 
     expect(onEdit).not.toHaveBeenCalled();
   });
+
+  it("renders lazy screen context outside the transcript editor with review provenance", () => {
+    const { container } = render(
+      <TranscriptRows
+        editable
+        turns={[
+          {
+            id: "turn-visual",
+            speakerId: "speaker-visual",
+            startMs: 10_000,
+            endMs: 20_000,
+            modelText: "As you can see on this screen, activation improved.",
+          },
+        ]}
+        speakers={[
+          {
+            id: "speaker-visual",
+            displayName: "Speaker 1",
+            initials: "S1",
+            color: "#676c72",
+            state: "Review",
+            attributionSource: "visual",
+            attributionConfidence: "review",
+          },
+        ]}
+        visualContext={[
+          {
+            id: "context-1",
+            meetingId: "meeting-1",
+            turnId: "turn-visual",
+            kind: "shared_content",
+            atMs: 12_000,
+            screenshotAssetId: "screen-1",
+            reason: "Captured when shared results were discussed.",
+            triggerText: "this screen",
+            confidence: "high",
+            source: "transcript_heuristic",
+            meetingSystem: "Microsoft Teams",
+            createdAtMs: 12_000,
+          },
+        ]}
+        visualContextUrls={{ "screen-1": "blob:screen-context" }}
+      />,
+    );
+
+    const image = screen.getByRole("img", {
+      name: "Screen context captured from Microsoft Teams at 00:00:12",
+    });
+    expect(image).toHaveAttribute("loading", "lazy");
+    expect(image).toHaveAttribute("decoding", "async");
+    expect(screen.getByText("Visual suggestion")).toBeInTheDocument();
+    expect(screen.getByText("Captured when shared results were discussed.")).toBeInTheDocument();
+
+    const editor = screen.getByRole("textbox", {
+      name: "Speaker 1 transcript at 00:00:10",
+    });
+    const figure = container.querySelector("figure.visual-context-card");
+    expect(figure).not.toBeNull();
+    expect(editor.contains(figure)).toBe(false);
+  });
 });

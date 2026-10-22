@@ -14,6 +14,7 @@ import {
   Merge,
   MessageSquare,
   MoreVertical,
+  Monitor,
   Pause,
   Pencil,
   Play,
@@ -40,6 +41,7 @@ import type {
   SpeakerState,
   TranscriptChatMessage,
   TranscriptTurn,
+  VisualContextEvent,
   VoiceProfile,
 } from "../../types";
 import { SpeakerAvatar } from "../../components/SpeakerAvatar";
@@ -52,10 +54,13 @@ type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
 interface TranscriptViewProps {
   meeting: Meeting;
   mediaSourceUrl?: string;
+  screenSourceUrl?: string;
   allowSimulatedPlayback: boolean;
   turns: TranscriptTurn[];
   speakers: MeetingSpeaker[];
   markers: Marker[];
+  visualContext: VisualContextEvent[];
+  visualContextUrls: Readonly<Record<string, string>>;
   processingJob?: ProcessingJob;
   profiles: VoiceProfile[];
   profileSampleTargetId?: string;
@@ -78,7 +83,7 @@ interface TranscriptViewProps {
     newProfileName?: string,
   ) => Promise<void>;
   onExport: (format: ExportFormat) => void;
-  onAskTranscript: (question: string, model?: string) => Promise<void>;
+  onAskTranscript: (question: string, model?: string, provider?: "local" | "chatgpt", cloudConsent?: boolean) => Promise<void>;
   onClearTranscriptChat: () => Promise<void>;
   onRefreshAgentStatus: () => Promise<void>;
 }
@@ -103,9 +108,12 @@ interface SpeakerCardProps {
   speaker: MeetingSpeaker;
   allSpeakers: MeetingSpeaker[];
   selected: boolean;
+  filtered: boolean;
+  onFilter: () => void;
   onRename: (name: string) => void;
   onMerge: (targetId: string) => void;
   suggestedProfileName?: string;
+  visualEvidence?: VisualContextEvent;
   onAcceptReview: () => void;
   onRejectReview: () => void;
 }
@@ -114,9 +122,12 @@ function SpeakerCard({
   speaker,
   allSpeakers,
   selected,
+  filtered,
+  onFilter,
   onRename,
   onMerge,
   suggestedProfileName,
+  visualEvidence,
   onAcceptReview,
   onRejectReview,
 }: SpeakerCardProps) {
@@ -135,11 +146,19 @@ function SpeakerCard({
     setEditing(false);
   }
 
+  const visualSuggestion =
+    speaker.attributionSource === "visual" || Boolean(visualEvidence);
+  const visualSuggestionName = visualEvidence?.suggestedSpeakerName ??
+    (speaker.attributionSource === "visual" ? speaker.displayName : undefined);
+
   return (
     <div
       className={`speaker-card${selected ? " is-selected" : ""}`}
       data-speaker-id={speaker.id}
       aria-current={selected ? "true" : undefined}
+      onClick={(event) => {
+        if (!(event.target as HTMLElement).closest("button, input, form")) onFilter();
+      }}
     >
       <div className="speaker-card__topline">
         <SpeakerAvatar initials={speaker.initials} color={speaker.color} />
@@ -166,7 +185,15 @@ function SpeakerCard({
             />
           </form>
         ) : (
-          <strong>{speaker.displayName}</strong>
+          <button
+            type="button"
+            className="speaker-card__filter"
+            aria-label={`Show only ${speaker.displayName}`}
+            aria-pressed={filtered}
+            onClick={onFilter}
+          >
+            {speaker.displayName}
+          </button>
         )}
         <SpeakerStateBadge state={speaker.state} />
         <button
@@ -215,6 +242,28 @@ function SpeakerCard({
         />
       </div>
 
+      {visualEvidence || speaker.attributionSource?.startsWith("visual") ? (
+        <div
+          className={`speaker-card__visual-evidence${
+            speaker.attributionSource === "visual_confirmed" ||
+            speaker.attributionConfidence === "confirmed"
+              ? " is-confirmed"
+              : " is-review"
+          }`}
+        >
+          <strong>
+            {speaker.attributionSource === "visual_confirmed" ||
+            speaker.attributionConfidence === "confirmed"
+              ? "Visual cue confirmed"
+              : "Visual suggestion · Review"}
+          </strong>
+          <p>
+            {visualEvidence?.reason ??
+              "Local meeting-app visual context contributed to this speaker suggestion."}
+          </p>
+        </div>
+      ) : null}
+
       {mergeOpen ? (
         <div className="speaker-card__merge">
           <span>Merge into</span>
@@ -241,13 +290,15 @@ function SpeakerCard({
           <button
             className="speaker-card__review"
             type="button"
-            disabled={!suggestedProfileName}
+            disabled={!suggestedProfileName && !visualSuggestion}
             onClick={onAcceptReview}
           >
             <Check size={16} />{" "}
             {suggestedProfileName
               ? `Accept ${suggestedProfileName}`
-              : "No suggested match"}
+              : visualSuggestionName
+                ? `Accept ${visualSuggestionName}`
+                : "No suggested match"}
           </button>
           <button type="button" onClick={onRejectReview}>
             <X size={15} /> Keep unknown
@@ -290,10 +341,13 @@ function findActiveWordId(
 export function TranscriptView({
   meeting,
   mediaSourceUrl,
+  screenSourceUrl,
   allowSimulatedPlayback,
   turns,
   speakers,
   markers,
+  visualContext,
+  visualContextUrls,
   processingJob,
   profiles,
   profileSampleTargetId,
@@ -317,6 +371,18 @@ export function TranscriptView({
   onRefreshAgentStatus,
 }: TranscriptViewProps) {
   const [search, setSearch] = useState("");
+  const [speakerFilter, setSpeakerFilter] = useState<{ meetingId: string; speakerId: string }>();
+  const filteredSpeaker = speakerFilter?.meetingId === meeting.id
+    ? speakers.find((speaker) => speaker.id === speakerFilter.speakerId)
+    : undefined;
+  const visibleTurns = useMemo(
+    () => filteredSpeaker ? turns.filter((turn) => turn.speakerId === filteredSpeaker.id) : turns,
+    [turns, filteredSpeaker],
+  );
+
+  useEffect(() => {
+    if (speakerFilter && !filteredSpeaker) setSpeakerFilter(undefined);
+  }, [speakerFilter, filteredSpeaker]);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(767_000);
   const [selectedTurn, setSelectedTurn] = useState<string | undefined>(
@@ -352,16 +418,16 @@ export function TranscriptView({
   }, [meeting.title]);
 
   useEffect(() => {
-    if (!turns.length) {
+    if (!visibleTurns.length) {
       setSelectedTurn(undefined);
       return;
     }
     setSelectedTurn((current) =>
-      current && turns.some((turn) => turn.id === current)
+      current && visibleTurns.some((turn) => turn.id === current)
         ? current
-        : turns[0].id,
+        : visibleTurns[0].id,
     );
-  }, [meeting.id, turns]);
+  }, [meeting.id, visibleTurns]);
   const selectedSpeaker = speakers.find(
     (speaker) => speaker.id === selectedSpeakerId,
   );
@@ -381,6 +447,18 @@ export function TranscriptView({
     words.sort((left, right) => left.startMs - right.startMs);
     return words;
   }, [turns]);
+  const visualEvidenceBySpeaker = useMemo(() => {
+    const turnSpeakerIds = new Map(
+      turns.map((turn) => [turn.id, turn.speakerId]),
+    );
+    const evidence = new Map<string, VisualContextEvent>();
+    for (const event of visualContext) {
+      if (event.kind !== "speaker_evidence") continue;
+      const speakerId = event.speakerId ?? turnSpeakerIds.get(event.turnId);
+      if (speakerId && !evidence.has(speakerId)) evidence.set(speakerId, event);
+    }
+    return evidence;
+  }, [turns, visualContext]);
   const positionActiveWordId = useMemo(
     () => findActiveWordId(wordTimeline, position),
     [position, wordTimeline],
@@ -524,7 +602,7 @@ export function TranscriptView({
       }
       if (
         event.code === "Space" &&
-        !["INPUT", "TEXTAREA"].includes((event.target as HTMLElement).tagName)
+        !["INPUT", "TEXTAREA", "BUTTON", "SELECT", "A"].includes((event.target as HTMLElement).tagName)
       ) {
         event.preventDefault();
         togglePlayback();
@@ -537,13 +615,13 @@ export function TranscriptView({
   const searchCount = useMemo(
     () =>
       search
-        ? turns.filter((turn) =>
+        ? visibleTurns.filter((turn) =>
             (turn.editedText ?? turn.modelText)
               .toLocaleLowerCase()
               .includes(search.toLocaleLowerCase()),
           ).length
         : 0,
-    [search, turns],
+    [search, visibleTurns],
   );
 
   return (
@@ -813,8 +891,42 @@ export function TranscriptView({
           aria-label="Transcript"
           ref={transcriptScrollRef}
         >
+          {screenSourceUrl ? (
+            <section
+              className="screen-recording-card"
+              aria-labelledby="screen-recording-title"
+            >
+              <div className="screen-recording-card__heading">
+                <span className="screen-recording-card__icon" aria-hidden="true">
+                  <Monitor size={19} strokeWidth={1.8} />
+                </span>
+                <span>
+                  <h2 id="screen-recording-title">Screen recording</h2>
+                  <p>All connected displays · saved locally</p>
+                </span>
+              </div>
+              <video
+                className="screen-recording-card__video"
+                src={screenSourceUrl}
+                controls
+                preload="metadata"
+                playsInline
+                aria-label={`Screen recording for ${meeting.title}`}
+              >
+                Screen recording playback is not supported on this device.
+              </video>
+            </section>
+          ) : null}
+          {filteredSpeaker ? (
+            <div className="transcript-speaker-filter" role="status">
+              <span>Showing {filteredSpeaker.displayName} · {visibleTurns.length} segments</span>
+              <button type="button" onClick={() => setSpeakerFilter(undefined)}>
+                <X size={15} /> Show all speakers
+              </button>
+            </div>
+          ) : null}
           <TranscriptRows
-            turns={turns}
+            turns={visibleTurns}
             speakers={speakers}
             search={search}
             editable
@@ -822,6 +934,8 @@ export function TranscriptView({
             activeTurnId={activeTurnId}
             activeWordId={activeWordId}
             playbackPositionMs={position}
+            visualContext={visualContext}
+            visualContextUrls={visualContextUrls}
             onSelectTurn={(turnId) => {
               setSelectedTurn(turnId);
               const turn = turns.find((candidate) => candidate.id === turnId);
@@ -841,6 +955,7 @@ export function TranscriptView({
         >
           {sidePanel === "ask" ? (
             <TranscriptAssistantPanel
+              meetingId={meeting.id}
               meetingTitle={meeting.title}
               messages={chatMessages}
               status={agentStatus}
@@ -852,6 +967,7 @@ export function TranscriptView({
               onClear={onClearTranscriptChat}
               onRefreshStatus={onRefreshAgentStatus}
               onOpenCitation={(citation) => {
+                setSpeakerFilter(undefined);
                 setSelectedTurn(citation.turnId);
                 seekTo(citation.startMs);
                 window.setTimeout(() => {
@@ -891,9 +1007,16 @@ export function TranscriptView({
               speaker={speaker}
               allSpeakers={speakers}
               selected={speaker.id === selectedSpeakerId}
+              filtered={speaker.id === filteredSpeaker?.id}
+              onFilter={() => {
+                setSpeakerFilter({ meetingId: meeting.id, speakerId: speaker.id });
+                setSelectedTurn(turns.find((turn) => turn.speakerId === speaker.id)?.id);
+                if (transcriptScrollRef.current) transcriptScrollRef.current.scrollTop = 0;
+              }}
               suggestedProfileName={
                 profiles.find((profile) => profile.id === speaker.profileId)?.name
               }
+              visualEvidence={visualEvidenceBySpeaker.get(speaker.id)}
               onRename={(name) => onRenameSpeaker(speaker.id, name)}
               onMerge={(targetId) => onMergeSpeaker(speaker.id, targetId)}
               onAcceptReview={() => onReviewSpeaker(speaker.id, true)}
@@ -1054,7 +1177,7 @@ export function TranscriptView({
             onSubmit={(event) => {
               event.preventDefault();
               if (!findText) return;
-              turns.forEach((turn) => {
+              visibleTurns.forEach((turn) => {
                 const current = turn.editedText ?? turn.modelText;
                 if (current.includes(findText)) {
                   onUpdateTurn(
@@ -1079,7 +1202,7 @@ export function TranscriptView({
               placeholder="Replace with"
             />
             <button type="submit" disabled={!findText}>
-              Replace all
+              {filteredSpeaker ? "Replace for this speaker" : "Replace all"}
             </button>
             <button type="button" onClick={() => setReplaceOpen(false)}>
               Cancel

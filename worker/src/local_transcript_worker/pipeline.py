@@ -46,6 +46,7 @@ from .schema import (
     SourceAsset,
     WordTiming,
 )
+from .speaker_review import review_speaker_fragments
 
 PIPELINE_STAGES = (
     "normalize",
@@ -185,6 +186,10 @@ class FinalPipeline:
             )
         finally:
             release_backend(self.embedder)
+        # Re-run even on resumed jobs; cached intermediate artifacts remain raw
+        # evidence, while final artifacts receive the same deterministic checks.
+        merged, fragment_warnings = review_speaker_fragments(merged, diarization)
+        warnings.extend(fragment_warnings)
         final_artifact, turns = self._index_and_finalize(
             request, merged, matches, checkpoint, store, warnings
         )

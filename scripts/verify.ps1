@@ -22,10 +22,14 @@ try {
     }
 
     if (-not $SkipWorker) {
-        uv sync --project "$workspace\worker" --group dev
-        uv run --project "$workspace\worker" ruff check "$workspace\worker"
-        uv run --project "$workspace\worker" mypy
-        uv run --project "$workspace\worker" pytest
+        # The desktop development shell and the worker unit tests intentionally
+        # share worker/.venv. Keep an already-installed `ml` extra intact while
+        # adding the lightweight verification tools; an exact sync here used to
+        # silently remove faster-whisper before the next desktop run.
+        uv sync --project "$workspace\worker" --group dev --inexact
+        uv run --project "$workspace\worker" --no-sync ruff check "$workspace\worker"
+        uv run --project "$workspace\worker" --no-sync mypy
+        uv run --project "$workspace\worker" --no-sync pytest
     }
 }
 finally {

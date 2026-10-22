@@ -16,6 +16,8 @@ use crate::{
 };
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
+const WEBVIEW_H264_ENCODER: &str = "h264_mf";
+const WEBVIEW_H264_QUALITY: &str = "75";
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "aac", "aif", "aiff", "avi", "flac", "m4a", "m4v", "mkv", "mov", "mp3", "mp4", "mpeg", "mpg",
     "oga", "ogg", "opus", "wav", "webm", "wma", "wmv",
@@ -40,15 +42,30 @@ struct FfprobeOutput {
 
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
+    index: Option<u32>,
     codec_type: Option<String>,
     codec_name: Option<String>,
     sample_rate: Option<String>,
     channels: Option<u16>,
+    #[serde(default)]
+    disposition: FfprobeDisposition,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfprobeDisposition {
+    #[serde(default)]
+    attached_pic: i32,
 }
 
 #[derive(Debug, Deserialize)]
 struct FfprobeFormat {
     duration: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProbeResult {
+    media: MediaProbe,
+    video_stream_index: Option<u32>,
 }
 
 pub fn validate_source(path: &Path) -> CoreResult<()> {
@@ -74,16 +91,176 @@ pub fn validate_source(path: &Path) -> CoreResult<()> {
 
 pub fn probe(layout: &AppLayout, path: &Path) -> CoreResult<MediaProbe> {
     validate_source(path)?;
-    ffprobe(&media_tools::resolve(layout, MediaTool::Ffprobe)?, path)
+    Ok(ffprobe(
+        &media_tools::resolve(layout, MediaTool::Ffprobe)?,
+        path,
+        RequiredStream::Audio,
+    )?
+    .media)
 }
 
-fn ffprobe(executable: &Path, path: &Path) -> CoreResult<MediaProbe> {
+/// Probe a screen recording that is intentionally video-only. Imported meeting
+/// media still goes through [`probe`] and must contain an audio stream.
+pub fn probe_visual(layout: &AppLayout, path: &Path) -> CoreResult<MediaProbe> {
+    validate_source(path)?;
+    Ok(ffprobe(
+        &media_tools::resolve(layout, MediaTool::Ffprobe)?,
+        path,
+        RequiredStream::Video,
+    )?
+    .media)
+}
+
+/// Probe an installer-managed visual file before it is published under its
+/// final extension. Recording recovery uses this for fragmented
+/// `*.mp4.partial` capture files and for atomic encoded outputs. The caller must
+/// already own the path; unlike imported media, no extension allowlist is
+/// applied.
+pub(crate) fn probe_unpublished_visual(layout: &AppLayout, path: &Path) -> CoreResult<MediaProbe> {
+    if !path.is_absolute() {
+        return Err(CoreError::InvalidInput(
+            "unpublished visual source must be an absolute managed path".into(),
+        ));
+    }
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(CoreError::InvalidInput(
+            "unpublished visual source is not a file".into(),
+        ));
+    }
+    layout.relative_to_root(path)?;
+    Ok(ffprobe(
+        &media_tools::resolve(layout, MediaTool::Ffprobe)?,
+        path,
+        RequiredStream::Video,
+    )?
+    .media)
+}
+
+/// Return the global FFmpeg stream index for the first real visual stream.
+/// Attached cover art is deliberately excluded so audio imports cannot be
+/// mistaken for meeting video context.
+pub(crate) fn probe_visual_stream_index(layout: &AppLayout, path: &Path) -> CoreResult<u32> {
+    validate_source(path)?;
+    ffprobe(
+        &media_tools::resolve(layout, MediaTool::Ffprobe)?,
+        path,
+        RequiredStream::Video,
+    )?
+    .video_stream_index
+    .ok_or_else(|| CoreError::Media("visual stream has no FFmpeg stream index".into()))
+}
+
+/// Encode a video-only MP4 using the Windows Media Foundation H.264 encoder.
+///
+/// Chromium/WebView2 does not guarantee MPEG-4 Part 2 playback, while H.264 in
+/// an MP4 container with 4:2:0 video is supported on normal Windows installs.
+/// The destination is published only after FFmpeg succeeds and FFprobe confirms
+/// the expected codec, so callers never persist a partially encoded derivative.
+pub fn transcode_visual_for_webview(
+    layout: &AppLayout,
+    source: &Path,
+    destination: &Path,
+) -> CoreResult<MediaProbe> {
+    if !cfg!(windows) {
+        return Err(CoreError::Media(
+            "WebView-compatible screen encoding currently requires Windows Media Foundation".into(),
+        ));
+    }
+    validate_source(source)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| CoreError::InvalidInput("video destination has no parent".into()))?;
+    fs::create_dir_all(parent)?;
+    let partial = mp4_partial_path(destination);
+    let _ = fs::remove_file(&partial);
+
+    let result = (|| -> CoreResult<MediaProbe> {
+        let executable = media_tools::resolve(layout, MediaTool::Ffmpeg)?;
+        let mut command = Command::new(executable);
+        command.args(["-y", "-hide_banner", "-v", "error", "-i"]);
+        command.arg(source);
+        command.args(["-an", "-vf", "format=yuv420p", "-fps_mode", "cfr"]);
+        command.args(webview_h264_encoder_args());
+        command.arg(&partial);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let output = command.output().map_err(|error| {
+            CoreError::Media(format!(
+                "FFmpeg Media Foundation H.264 encoding could not start: {error}"
+            ))
+        })?;
+        if !output.status.success() {
+            return Err(CoreError::Media(format!(
+                "FFmpeg Media Foundation H.264 encoding failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let probe = probe_visual(layout, &partial)?;
+        require_webview_h264(&probe)?;
+        let _ = fs::remove_file(destination);
+        fs::rename(&partial, destination)?;
+        sync_directory(parent);
+        Ok(probe)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    result
+}
+
+pub(crate) fn webview_h264_encoder_args() -> &'static [&'static str] {
+    &[
+        "-c:v",
+        WEBVIEW_H264_ENCODER,
+        "-rate_control",
+        "quality",
+        "-quality",
+        WEBVIEW_H264_QUALITY,
+        "-scenario",
+        "archive",
+        "-g",
+        "10",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+    ]
+}
+
+pub(crate) fn require_webview_h264(probe: &MediaProbe) -> CoreResult<()> {
+    if probe.codec.as_deref() == Some("h264") {
+        Ok(())
+    } else {
+        Err(CoreError::Media(format!(
+            "screen playback encoding produced {}, expected H.264",
+            probe.codec.as_deref().unwrap_or("an unknown codec")
+        )))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RequiredStream {
+    Audio,
+    Video,
+}
+
+fn ffprobe(executable: &Path, path: &Path, required: RequiredStream) -> CoreResult<ProbeResult> {
     let mut command = Command::new(executable);
     command.args([
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=codec_type,codec_name,sample_rate,channels",
+        "format=duration:stream=index,codec_type,codec_name,sample_rate,channels:stream_disposition=attached_pic",
         "-of",
         "json",
     ]);
@@ -111,37 +288,59 @@ fn ffprobe(executable: &Path, path: &Path) -> CoreResult<MediaProbe> {
         )));
     }
     let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout)?;
+    probe_from_output(parsed, path, required)
+}
+
+fn probe_from_output(
+    parsed: FfprobeOutput,
+    path: &Path,
+    required: RequiredStream,
+) -> CoreResult<ProbeResult> {
     let audio = parsed
         .streams
         .iter()
         .find(|stream| stream.codec_type.as_deref() == Some("audio"));
-    if audio.is_none() {
-        return Err(CoreError::Media(
-            "selected file does not contain an audio stream".into(),
-        ));
+    let video = parsed.streams.iter().find(|stream| {
+        stream.codec_type.as_deref() == Some("video") && stream.disposition.attached_pic == 0
+    });
+    match required {
+        RequiredStream::Audio if audio.is_none() => {
+            return Err(CoreError::Media(
+                "selected file does not contain an audio stream".into(),
+            ));
+        }
+        RequiredStream::Video if video.is_none() => {
+            return Err(CoreError::Media(
+                "selected media does not contain a timed visual stream".into(),
+            ));
+        }
+        _ => {}
     }
-    let has_video = parsed
-        .streams
-        .iter()
-        .any(|stream| stream.codec_type.as_deref() == Some("video"));
     let duration_ms = parsed
         .format
-        .and_then(|format| format.duration)
+        .as_ref()
+        .and_then(|format| format.duration.as_ref())
         .and_then(|duration| duration.parse::<f64>().ok())
         .filter(|duration| duration.is_finite() && *duration >= 0.0)
         .map(|duration| (duration * 1000.0).round() as i64);
-    Ok(MediaProbe {
-        kind: if has_video { "video" } else { "audio" }.into(),
-        content_type: mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .essence_str()
-            .into(),
-        duration_ms,
-        codec: audio.and_then(|stream| stream.codec_name.clone()),
-        sample_rate_hz: audio
-            .and_then(|stream| stream.sample_rate.as_ref())
-            .and_then(|rate| rate.parse::<u32>().ok()),
-        channels: audio.and_then(|stream| stream.channels),
+    Ok(ProbeResult {
+        media: MediaProbe {
+            kind: if video.is_some() { "video" } else { "audio" }.into(),
+            content_type: mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .essence_str()
+                .into(),
+            duration_ms,
+            codec: match required {
+                RequiredStream::Audio => audio.and_then(|stream| stream.codec_name.clone()),
+                RequiredStream::Video => video.and_then(|stream| stream.codec_name.clone()),
+            },
+            sample_rate_hz: audio
+                .and_then(|stream| stream.sample_rate.as_ref())
+                .and_then(|rate| rate.parse::<u32>().ok()),
+            channels: audio.and_then(|stream| stream.channels),
+        },
+        video_stream_index: video.and_then(|stream| stream.index),
     })
 }
 
@@ -254,6 +453,14 @@ pub fn partial_path(destination: &Path) -> PathBuf {
     destination.with_file_name(format!("{name}.partial"))
 }
 
+fn mp4_partial_path(destination: &Path) -> PathBuf {
+    let name = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("screen.mp4");
+    destination.with_file_name(format!("{name}.partial.mp4"))
+}
+
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -293,5 +500,99 @@ mod tests {
         let source = temp.path().join("notes.txt");
         fs::write(&source, b"text").unwrap();
         assert!(probe(&layout, &source).is_err());
+    }
+
+    #[test]
+    fn webview_video_args_use_media_foundation_h264_without_gpl_codecs() {
+        let arguments = webview_h264_encoder_args();
+        assert!(arguments.windows(2).any(|pair| pair == ["-c:v", "h264_mf"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+        assert!(arguments.iter().any(|argument| *argument == "+faststart"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument.contains("libx264")));
+    }
+
+    #[test]
+    fn webview_video_validation_rejects_mpeg4_part_two() {
+        let mut probe = MediaProbe {
+            kind: "video".into(),
+            content_type: "video/mp4".into(),
+            duration_ms: Some(1_000),
+            codec: Some("mpeg4".into()),
+            sample_rate_hz: None,
+            channels: None,
+        };
+        assert!(require_webview_h264(&probe).is_err());
+        probe.codec = Some("h264".into());
+        assert!(require_webview_h264(&probe).is_ok());
+    }
+
+    #[test]
+    fn attached_cover_art_does_not_make_an_audio_import_visual() {
+        let parsed: FfprobeOutput = serde_json::from_value(serde_json::json!({
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "sample_rate": "48000",
+                    "channels": 2
+                },
+                {
+                    "index": 1,
+                    "codec_type": "video",
+                    "codec_name": "mjpeg",
+                    "disposition": { "attached_pic": 1 }
+                }
+            ],
+            "format": { "duration": "12.5" }
+        }))
+        .unwrap();
+
+        let result =
+            probe_from_output(parsed, Path::new("meeting.m4a"), RequiredStream::Audio).unwrap();
+
+        assert_eq!(result.media.kind, "audio");
+        assert_eq!(result.media.codec.as_deref(), Some("aac"));
+        assert_eq!(result.video_stream_index, None);
+    }
+
+    #[test]
+    fn real_video_wins_over_attached_art_and_retains_global_stream_index() {
+        let parsed: FfprobeOutput = serde_json::from_value(serde_json::json!({
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "opus",
+                    "sample_rate": "48000",
+                    "channels": 2
+                },
+                {
+                    "index": 1,
+                    "codec_type": "video",
+                    "codec_name": "mjpeg",
+                    "disposition": { "attached_pic": 1 }
+                },
+                {
+                    "index": 4,
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "disposition": { "attached_pic": 0 }
+                }
+            ],
+            "format": { "duration": "42.0" }
+        }))
+        .unwrap();
+
+        let result =
+            probe_from_output(parsed, Path::new("meeting.mkv"), RequiredStream::Video).unwrap();
+
+        assert_eq!(result.media.kind, "video");
+        assert_eq!(result.media.codec.as_deref(), Some("h264"));
+        assert_eq!(result.video_stream_index, Some(4));
     }
 }

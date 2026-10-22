@@ -129,8 +129,10 @@ impl AppLayout {
     }
 
     pub fn relative_to_root(&self, path: &Path) -> CoreResult<String> {
-        let relative = path
-            .strip_prefix(&self.root)
+        let canonical_root = self.root.canonicalize()?;
+        let canonical_path = path.canonicalize()?;
+        let relative = canonical_path
+            .strip_prefix(&canonical_root)
             .map_err(|_| CoreError::Security("path is outside the application data root".into()))?;
         Ok(relative.to_string_lossy().replace('\\', "/"))
     }
@@ -357,6 +359,20 @@ mod tests {
         let layout = AppLayout::create(temp.path()).unwrap();
         assert!(layout.resolve_relative("../secret").is_err());
         assert!(layout.resolve_relative("C:/Windows/notepad.exe").is_err());
+    }
+
+    #[test]
+    fn resolved_managed_path_round_trips_to_normalized_relative_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = AppLayout::create(temp.path().join("app")).unwrap();
+        let relative = "library/recordings/meeting/screen-playback.mp4";
+        let managed = layout.root().join(relative);
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, b"managed video").unwrap();
+
+        let resolved = layout.resolve_relative(relative).unwrap();
+
+        assert_eq!(layout.relative_to_root(&resolved).unwrap(), relative);
     }
 
     #[test]

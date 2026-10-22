@@ -161,11 +161,24 @@ try {
     if (-not [bool]$message.ok -or [string]$message.result.status -ne "ok") {
         throw "The packaged worker health check failed."
     }
+    $health = $message.result
+    $requiredMlComponents = @(
+        "faster_whisper",
+        "whisperx",
+        "pyannote.audio",
+        "torch"
+    )
+    foreach ($component in $requiredMlComponents) {
+        $componentProperty = $health.packages.PSObject.Properties[$component]
+        if ($null -eq $componentProperty -or -not [bool]$componentProperty.Value) {
+            throw "The packaged worker is missing the required ML runtime component '$component'."
+        }
+    }
     if (
         $RequireNvidia -and
         (
-            -not [bool]$message.result.gpu.torch_cuda -or
-            -not [bool]$message.result.gpu.ctranslate2_cuda
+            -not [bool]$health.gpu.torch_cuda -or
+            -not [bool]$health.gpu.ctranslate2_cuda
         )
     ) {
         throw "The packaged NVIDIA worker did not expose both PyTorch and CTranslate2 CUDA backends."
@@ -191,11 +204,12 @@ try {
     [pscustomobject]@{
         protocol_version = [string]$hello.protocol_version
         pipeline_version = [string]$hello.payload.pipeline_version
-        worker_version = [string]$message.result.worker_version
-        torch_cuda = [bool]$message.result.gpu.torch_cuda
-        ctranslate2_cuda = [bool]$message.result.gpu.ctranslate2_cuda
-        ctranslate2_device_count = [int]$message.result.gpu.ctranslate2_device_count
-        network_mode = [string]$message.result.network_mode
+        worker_version = [string]$health.worker_version
+        torch_cuda = [bool]$health.gpu.torch_cuda
+        ctranslate2_cuda = [bool]$health.gpu.ctranslate2_cuda
+        ctranslate2_device_count = [int]$health.gpu.ctranslate2_device_count
+        network_mode = [string]$health.network_mode
+        required_ml_components = $requiredMlComponents
     }
 } finally {
     if ($process -and -not $process.HasExited) {

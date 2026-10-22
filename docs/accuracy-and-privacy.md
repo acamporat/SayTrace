@@ -12,6 +12,15 @@ The product favors precision over coverage:
 - Uncertain or short clusters remain `Unknown`.
 - Similarity values are not displayed as probabilities.
 
+Visual meeting context is a separate evidence source, not biometric identity.
+SayTrace may inspect locally captured frames for a visible participant label,
+profile tile, or active-speaker treatment. It requires agreeing observations
+from distinct turns and a clear winner before proposing a display name. The
+proposal remains `Review` until a person accepts it, records the model and
+meeting-system provenance, and never overwrites a manual or voice-confirmed
+assignment. Missing, ambiguous, stale, or unsupported meeting UI stays
+`Unknown`.
+
 The release calibration target is at least 99% precision for automatically accepted
 names and less than 1% false acceptance of unknown speakers. The checked-in
 thresholds are conservative starting values, not evidence that this gate has been
@@ -53,12 +62,40 @@ normal SayTrace installer. Explicit first-run model setup may then
 download revision-pinned, SHA-256-verified model files once the user accepts the
 Community-1 terms. After setup:
 
-- inference performs no network requests;
+- local transcription, speaker processing, and local AI perform no network requests;
 - implicit token discovery is disabled;
 - Hugging Face offline mode is enabled;
 - pyannote metrics and Hugging Face telemetry are disabled;
 - the application has no background or in-app release update feed;
 - local model-status refreshes do not contact model hosts; and
-- network access is enabled only for explicit model provisioning.
+- network access is used for explicit model provisioning and optional ChatGPT sign-in / cloud Q&A.
+
+ChatGPT is an optional provider in the Ask panel. Local AI remains the default.
+Sign-in alone does not upload a meeting. Cloud questions require separate sharing
+consent, checked in the trusted backend before reading context or starting a request.
+Questions, relevant transcript excerpts, speaker names, and recent chat history
+are sent to OpenAI only when the user sends a cloud question. Audio and video stay
+local. Consent resets on meeting/provider changes. Cloud replies and citations
+are stored in the local library and labeled as ChatGPT answers. Codex manages a
+separate SayTrace login, uses an isolated workspace, and has tools and external
+actions disabled for this feature. Account/model access and usage limits require
+a successfully completed request to verify; a listed model is not an entitlement.
 
 Offline acceptance testing blocks DNS and outbound traffic and removes the setup token before a complete transcription run.
+
+## Screen recording boundary
+
+Whole-desktop recording across all connected displays is enabled by default, but
+it is not silently implied by enabling audio recording: a separate review step
+blocks recording until the user acknowledges the disclosure or deliberately
+chooses audio-only capture. The saved track can include notifications,
+credentials, unrelated applications, and any other pixels visible on any
+connected display. Extracted screenshots are ordinary local JPEG files governed
+by the same retention and deletion behavior as the meeting.
+SayTrace does not redact them automatically; users should close or hide sensitive
+content before capture and use BitLocker when at-rest protection is required.
+
+Automatic screenshot selection is deterministic and bounded. Transcript cues
+such as a direct reference to shared material nominate timestamps, but this is a
+relevance heuristic rather than a claim that every important visual—or only an
+important visual—will be selected.

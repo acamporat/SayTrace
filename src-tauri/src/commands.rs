@@ -131,6 +131,34 @@ pub async fn get_local_agent_status() -> CommandResult<LocalAgentStatus> {
 }
 
 #[tauri::command]
+pub async fn get_chatgpt_agent_status(
+    state: State<'_, AppState>,
+) -> CommandResult<crate::codex_agent::ChatGptStatus> {
+    let agent = state.codex_agent.clone();
+    tauri::async_runtime::spawn_blocking(move || agent.status())
+        .await
+        .map_err(|_| ApiError::new("chatgpt_agent_failed", "Could not check ChatGPT status."))
+}
+
+#[tauri::command]
+pub async fn sign_in_chatgpt(state: State<'_, AppState>) -> CommandResult<String> {
+    let agent = state.codex_agent.clone();
+    tauri::async_runtime::spawn_blocking(move || agent.sign_in())
+        .await
+        .map_err(|_| ApiError::new("chatgpt_agent_failed", "Could not start ChatGPT sign-in."))?
+        .map_err(|message| ApiError::new("chatgpt_sign_in_failed", message))
+}
+
+#[tauri::command]
+pub async fn sign_out_chatgpt(state: State<'_, AppState>) -> CommandResult<()> {
+    let agent = state.codex_agent.clone();
+    tauri::async_runtime::spawn_blocking(move || agent.sign_out())
+        .await
+        .map_err(|_| ApiError::new("chatgpt_agent_failed", "Could not sign out of ChatGPT."))?
+        .map_err(|message| ApiError::new("chatgpt_sign_out_failed", message))
+}
+
+#[tauri::command]
 pub fn list_transcript_chat(
     meeting_id: String,
     state: State<'_, AppState>,
@@ -146,6 +174,19 @@ pub async fn ask_transcript(
     request: AskTranscriptRequest,
     state: State<'_, AppState>,
 ) -> CommandResult<TranscriptChatMessage> {
+    let provider = request.provider.as_deref().unwrap_or("local");
+    if !matches!(provider, "local" | "chatgpt") {
+        return Err(ApiError::new(
+            "invalid_provider",
+            "Choose local AI or ChatGPT.",
+        ));
+    }
+    if provider == "chatgpt" && !request.cloud_consent {
+        return Err(ApiError::new(
+            "cloud_consent_required",
+            "Allow sending transcript excerpts and chat history to ChatGPT first.",
+        ));
+    }
     let question = request.question.trim();
     if question.is_empty() || question.chars().count() > 500 {
         return Err(ApiError::new(
@@ -167,31 +208,56 @@ pub async fn ask_transcript(
         .core
         .list_transcript_chat(&request.meeting_id, 20)
         .map_err(ApiError::from)?;
-    let status = crate::local_agent::status().await;
-    let model = request
-        .model
-        .as_deref()
-        .or(status.selected_model.as_deref())
-        .map(str::to_string);
+    let local_status = if provider == "local" {
+        Some(crate::local_agent::status().await)
+    } else {
+        None
+    };
+    let model = if provider == "chatgpt" {
+        Some(format!(
+            "chatgpt:{}",
+            request.model.as_deref().unwrap_or("default")
+        ))
+    } else {
+        request.model.clone().or_else(|| {
+            local_status
+                .as_ref()
+                .and_then(|status| status.selected_model.clone())
+        })
+    };
     state
         .core
         .save_transcript_chat_message(
             &request.meeting_id,
             "user",
-            question.to_string(),
+            question.to_owned(),
             Vec::new(),
             model.clone(),
         )
         .map_err(ApiError::from)?;
-    let reply = crate::local_agent::ask(
-        &status,
-        request.model.as_deref(),
-        question,
-        &turns,
-        &history,
-    )
-    .await
-    .map_err(local_agent_api_error)?;
+    let reply = if provider == "chatgpt" {
+        let agent = state.codex_agent.clone();
+        let question = question.to_owned();
+        let requested_model = request.model.clone();
+        let consent = request.cloud_consent;
+        tauri::async_runtime::spawn_blocking(move || {
+            agent.ask(
+                consent,
+                requested_model.as_deref(),
+                &question,
+                &turns,
+                &history,
+            )
+        })
+        .await
+        .map_err(|_| ApiError::new("chatgpt_agent_failed", "ChatGPT request could not finish."))?
+        .map_err(|message| ApiError::new("chatgpt_agent_failed", message).retryable())?
+    } else {
+        let status = local_status.as_ref().expect("local provider has status");
+        crate::local_agent::ask(status, request.model.as_deref(), question, &turns, &history)
+            .await
+            .map_err(local_agent_api_error)?
+    };
     state
         .core
         .save_transcript_chat_message(
@@ -636,4 +702,65 @@ fn ensure_speaker_in_meeting(
             "speaker does not belong to the meeting",
         ))
     }
+}
+
+#[tauri::command]
+pub fn export_speaker_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CommandResult<crate::speaker_backup::SpeakerBackupResult> {
+    let (mut result, bytes) = state.core.speaker_backup_bytes().map_err(ApiError::from)?;
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .set_file_name(format!("SayTrace-speakers-{}.json", crate::db::now_ms()))
+        .add_filter("Speaker backup", &["json"])
+        .blocking_save_file()
+    else {
+        return Ok(result);
+    };
+    let path = selected
+        .into_path()
+        .map_err(|e| ApiError::new("invalid_file_selection", e.to_string()))?;
+    // A fresh filename protects an existing recovery copy from accidental replacement.
+    crate::speaker_backup::write_backup(&path, &bytes).map_err(ApiError::from)?;
+    result.path = Some(path.to_string_lossy().into_owned());
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn import_speaker_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CommandResult<crate::speaker_backup::SpeakerBackupResult> {
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .add_filter("Speaker backup", &["json"])
+        .blocking_pick_file()
+    else {
+        return Ok(Default::default());
+    };
+    let path = selected
+        .into_path()
+        .map_err(|e| ApiError::new("invalid_file_selection", e.to_string()))?;
+    let size = std::fs::metadata(&path)
+        .map_err(CoreError::Io)
+        .map_err(ApiError::from)?
+        .len();
+    if size > 64 * 1024 * 1024 {
+        return Err(ApiError::new(
+            "invalid_backup",
+            "Speaker backup exceeds 64 MB",
+        ));
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(CoreError::Io)
+        .map_err(ApiError::from)?;
+    let mut result = state
+        .core
+        .restore_speaker_backup(&bytes)
+        .map_err(ApiError::from)?;
+    result.path = Some(path.to_string_lossy().into_owned());
+    Ok(result)
 }

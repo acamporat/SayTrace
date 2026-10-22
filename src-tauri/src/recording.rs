@@ -10,11 +10,11 @@ use std::{
         Arc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
@@ -32,12 +32,16 @@ use crate::{
         AudioDeviceList, Meeting, RecordingConfig, RecordingMarker, RecordingSession,
         RecordingState, RecordingStatus,
     },
+    screen_capture::{self, ScreenCapture, ScreenCaptureShared, ScreenCaptureSummary},
     service::CoreService,
     worker::{AudioMetadata, WorkerRequest, WorkerSupervisor},
 };
 
 const CAPTION_QUEUE_CHUNKS: usize = 2048;
 const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(8);
+const SCREEN_PLAYBACK_RETRY_DELAY_MS: i64 = 60_000;
+const MAX_RECOVERED_SCREEN_START_OFFSET_MS: i64 = 20_000;
+const RECOVERY_END_MTIME_TOLERANCE_MS: i64 = 2_000;
 
 struct ActiveTrack {
     track_id: String,
@@ -57,6 +61,8 @@ struct ActiveRecording {
     paused_total: Duration,
     current_pause_id: Option<String>,
     tracks: Vec<ActiveTrack>,
+    screen_capture: Option<ScreenCapture>,
+    screen_warning: Option<String>,
     manifest_path: PathBuf,
     monitor_stop: Arc<AtomicBool>,
     monitor_handle: Option<thread::JoinHandle<()>>,
@@ -272,6 +278,27 @@ impl RecordingManager {
             }
         }
 
+        let (screen_capture, screen_warning) = if config.capture_screen {
+            let directory = session_directory.join("screen");
+            match screen_capture::spawn(self.core.layout(), directory, qpc_start, qpc_frequency) {
+                Ok(capture) => (Some(capture), None),
+                Err(error) => {
+                    let message = format!("Screen capture could not start: {error}");
+                    persist_capture_warning(
+                        &self.core,
+                        &app,
+                        &session_id,
+                        &manifest_path,
+                        "screen",
+                        &message,
+                    );
+                    (None, Some(message))
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         let live_streams = tracks
             .iter()
             .map(|track| {
@@ -303,6 +330,7 @@ impl RecordingManager {
                 .iter()
                 .map(|track| (track.kind, track.shared.clone()))
                 .collect(),
+            screen_capture.as_ref().map(ScreenCapture::shared),
             monitor_stop.clone(),
         ));
         let active = ActiveRecording {
@@ -315,6 +343,8 @@ impl RecordingManager {
             paused_total: Duration::ZERO,
             current_pause_id: None,
             tracks,
+            screen_capture,
+            screen_warning,
             manifest_path,
             monitor_stop,
             monitor_handle,
@@ -368,6 +398,22 @@ impl RecordingManager {
                     .collect::<Vec<_>>()
                     .join("; "),
             ));
+        }
+        if let Some(error) = recording
+            .screen_capture
+            .as_ref()
+            .and_then(|capture| capture.pause().err())
+        {
+            let message = format!("Screen capture could not pause cleanly: {error}");
+            persist_capture_warning(
+                &self.core,
+                &app,
+                &recording.id,
+                &recording.manifest_path,
+                "screen",
+                &message,
+            );
+            append_warning(&mut recording.screen_warning, message);
         }
         recording.state = RecordingState::Paused;
         recording.paused_at = Some(Instant::now());
@@ -434,6 +480,22 @@ impl RecordingManager {
                     .collect::<Vec<_>>()
                     .join("; "),
             ));
+        }
+        if let Some(error) = recording
+            .screen_capture
+            .as_ref()
+            .and_then(|capture| capture.resume().err())
+        {
+            let message = format!("Screen capture could not resume cleanly: {error}");
+            persist_capture_warning(
+                &self.core,
+                &app,
+                &recording.id,
+                &recording.manifest_path,
+                "screen",
+                &message,
+            );
+            append_warning(&mut recording.screen_warning, message);
         }
         let paused_at = recording
             .paused_at
@@ -549,7 +611,11 @@ impl RecordingManager {
         if let Some(handle) = recording.monitor_handle.take() {
             let _ = handle.join();
         }
-        let mut errors = Vec::new();
+        let mut errors = recording
+            .screen_warning
+            .take()
+            .into_iter()
+            .collect::<Vec<_>>();
         for track in &recording.tracks {
             if let Err(error) = track.command_sender.try_send(CaptureCommand::Stop) {
                 let message = format!(
@@ -568,6 +634,39 @@ impl RecordingManager {
                 errors.push(message);
             }
         }
+        let screen_summary = if let Some(capture) = recording.screen_capture.as_mut() {
+            match capture.stop() {
+                Ok(summary) => {
+                    if let Some(message) = &summary.warning {
+                        persist_capture_warning(
+                            &self.core,
+                            &app,
+                            &recording.id,
+                            &recording.manifest_path,
+                            "screen",
+                            message,
+                        );
+                        errors.push(message.clone());
+                    }
+                    Some(summary)
+                }
+                Err(error) => {
+                    let message = format!("Screen capture could not stop cleanly: {error}");
+                    persist_capture_warning(
+                        &self.core,
+                        &app,
+                        &recording.id,
+                        &recording.manifest_path,
+                        "screen",
+                        &message,
+                    );
+                    errors.push(message);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut summaries = Vec::new();
         for track in &mut recording.tracks {
             if let Some(handle) = track.handle.take() {
@@ -628,6 +727,34 @@ impl RecordingManager {
                 Err(error) => errors.push(error.to_string()),
             }
         }
+        let screen_asset = screen_summary
+            .as_ref()
+            .filter(|summary| !summary.segments.is_empty())
+            .and_then(|summary| {
+                match consolidate_screen(
+                    self.core.layout(),
+                    &recording.meeting_id,
+                    &recording.id,
+                    summary,
+                    false,
+                ) {
+                    Ok(asset) => Some(asset),
+                    Err(error) => {
+                        let message =
+                            format!("Screen recording could not be consolidated: {error}");
+                        persist_capture_warning(
+                            &self.core,
+                            &app,
+                            &recording.id,
+                            &recording.manifest_path,
+                            "screen",
+                            &message,
+                        );
+                        errors.push(message);
+                        None
+                    }
+                }
+            });
         let playback = if assets.len() == 2 {
             match mix_tracks(
                 self.core.layout(),
@@ -645,9 +772,18 @@ impl RecordingManager {
         } else {
             None
         };
+        let screen_duration_ms = screen_asset.as_ref().map(|asset| {
+            asset.duration_ms.unwrap_or_else(|| {
+                screen_summary
+                    .as_ref()
+                    .map(ScreenCaptureSummary::duration_ms)
+                    .unwrap_or(0)
+            })
+        });
         let duration_ms = assets
             .iter()
             .filter_map(|(_, _, _, asset)| asset.duration_ms)
+            .chain(screen_duration_ms)
             .max()
             .unwrap_or(0);
 
@@ -678,6 +814,9 @@ impl RecordingManager {
                 )?;
             }
             if let Some(asset) = &playback {
+                insert_recording_asset(&transaction, &recording.meeting_id, asset, ended_at_ms)?;
+            }
+            if let Some(asset) = &screen_asset {
                 insert_recording_asset(&transaction, &recording.meeting_id, asset, ended_at_ms)?;
             }
             let successful = !assets.is_empty();
@@ -717,6 +856,8 @@ impl RecordingManager {
                 "durationMs":duration_ms,
                 "assets":assets.iter().map(|(_,_,_,asset)| &asset.id).collect::<Vec<_>>(),
                 "playbackAsset":playback.as_ref().map(|asset| &asset.id),
+                "screenAsset":screen_asset.as_ref().map(|asset| &asset.id),
+                "screenSummary":screen_summary,
                 "clockPlans":assets.iter().map(|(_,summary,plan,_)| json!({
                     "source":summary.kind.as_str(),
                     "startOffsetMs":plan.start_offset_ms,
@@ -807,7 +948,7 @@ fn status_from_active(active: &ActiveRecording) -> RecordingStatus {
         .tracks
         .iter()
         .find(|track| track.kind == CaptureKind::Loopback);
-    let failures = active
+    let mut failures = active
         .tracks
         .iter()
         .filter_map(|track| {
@@ -817,6 +958,23 @@ fn status_from_active(active: &ActiveRecording) -> RecordingStatus {
                 .map(|error| format!("{}: {error}", track.kind.as_str()))
         })
         .collect::<Vec<_>>();
+    if let Some(warning) = &active.screen_warning {
+        failures.push(warning.clone());
+    }
+    let screen_capture_active = active
+        .screen_capture
+        .as_ref()
+        .is_some_and(|capture| capture.shared().is_active());
+    if let Some(message) = active
+        .screen_capture
+        .as_ref()
+        .and_then(|capture| capture.shared().failure())
+    {
+        let message = format!("screen: {message}");
+        if !failures.contains(&message) {
+            failures.push(message);
+        }
+    }
     let any_live = active.tracks.iter().any(|track| track.shared.is_live());
     RecordingStatus {
         state: if !failures.is_empty() && !any_live {
@@ -829,6 +987,7 @@ fn status_from_active(active: &ActiveRecording) -> RecordingStatus {
         elapsed_ms: elapsed_ms(active),
         microphone_active: microphone.is_some_and(|track| track.shared.is_live()),
         system_audio_active: loopback.is_some_and(|track| track.shared.is_live()),
+        screen_capture_active,
         microphone_level: microphone
             .map(|track| track.shared.level())
             .unwrap_or_default(),
@@ -947,6 +1106,17 @@ fn append_manifest(path: &Path, value: Value) -> CoreResult<()> {
     Ok(())
 }
 
+fn append_warning(warning: &mut Option<String>, message: String) {
+    match warning {
+        Some(existing) if !existing.contains(&message) => {
+            existing.push_str("; ");
+            existing.push_str(&message);
+        }
+        Some(_) => {}
+        None => *warning = Some(message),
+    }
+}
+
 fn persist_capture_warning(
     core: &CoreService,
     app: &AppHandle,
@@ -995,6 +1165,7 @@ fn spawn_monitor(
     session_id: String,
     manifest_path: PathBuf,
     tracks: Vec<(CaptureKind, Arc<CaptureShared>)>,
+    screen: Option<Arc<ScreenCaptureShared>>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
@@ -1003,6 +1174,7 @@ fn spawn_monitor(
             let mut ticks = 0_u32;
             let mut anchor_cursors = vec![0_usize; tracks.len()];
             let mut reported_failures = BTreeMap::<String, bool>::new();
+            let mut screen_failure_reported = false;
             let mut terminal_failure_persisted = false;
             while !stop.load(Ordering::Relaxed) {
                 let microphone = tracks
@@ -1035,6 +1207,19 @@ fn spawn_monitor(
                             &message,
                         );
                         reported_failures.insert(source, true);
+                    }
+                }
+                if !screen_failure_reported {
+                    if let Some(message) = screen.as_ref().and_then(|shared| shared.failure()) {
+                        persist_capture_warning(
+                            &core,
+                            &app,
+                            &session_id,
+                            &manifest_path,
+                            "screen",
+                            &message,
+                        );
+                        screen_failure_reported = true;
                     }
                 }
                 if !terminal_failure_persisted
@@ -1272,10 +1457,36 @@ struct RecoverableTrack {
     channels: u16,
 }
 
+#[derive(Debug, Default)]
+struct RecoverySegmentCandidates {
+    finalized: Option<PathBuf>,
+    partial: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct RecoverableAudio {
+    paths: Vec<PathBuf>,
+    frames: u64,
+    partial_names: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RecoverableScreen {
+    summary: ScreenCaptureSummary,
+    source_names: Vec<String>,
+    partial_names: Vec<String>,
+    source_duration_ms: i64,
+    filesystem_start_offset_ms: Option<i64>,
+    estimated_start_offset_ms: Option<i64>,
+    warnings: Vec<String>,
+}
+
 pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<usize> {
     let connection = core.database().connect()?;
     let mut statement = connection.prepare(
-        "SELECT id,meeting_id,config_json,manifest_relative_path,qpc_frequency,qpc_start
+        "SELECT id,meeting_id,config_json,manifest_relative_path,qpc_frequency,qpc_start,
+                started_at_ms,paused_duration_ms
          FROM recording_sessions
          WHERE state IN ('starting','recording','paused','finalizing')
          ORDER BY started_at_ms,id",
@@ -1289,6 +1500,8 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1296,7 +1509,17 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
     drop(connection);
 
     let mut recovered = 0_usize;
-    for (session_id, meeting_id, config_json, manifest_relative, frequency, qpc_start) in sessions {
+    for (
+        session_id,
+        meeting_id,
+        config_json,
+        manifest_relative,
+        frequency,
+        qpc_start,
+        started_at_ms,
+        paused_duration_ms,
+    ) in sessions
+    {
         let config =
             serde_json::from_str::<RecordingConfig>(&config_json).unwrap_or_else(|error| {
                 log::warn!(
@@ -1357,8 +1580,8 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
         ];
         let mut recovered_assets = Vec::new();
         for track in &tracks {
-            let segments = match recoverable_wav_segments(&track.directory) {
-                Ok(segments) => segments,
+            let recoverable = match recoverable_wav_segments(&track.directory, track.channels) {
+                Ok(recoverable) => recoverable,
                 Err(error) => {
                     warnings.push(format!(
                         "{} segment directory could not be read: {error}",
@@ -1367,21 +1590,26 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
                     continue;
                 }
             };
-            if segments.is_empty() {
+            warnings.extend(
+                recoverable
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("{} {warning}", track.kind.as_str())),
+            );
+            if recoverable.paths.is_empty() {
                 continue;
             }
-            let frames = match validate_recovery_segments(&segments, track.channels) {
-                Ok(frames) => frames,
-                Err(error) => {
-                    warnings.push(format!(
-                        "{} segments could not be recovered: {error}",
-                        track.kind.as_str()
-                    ));
-                    continue;
-                }
-            };
+            let frames = recoverable.frames;
             if frames == 0 {
                 continue;
+            }
+            if !recoverable.partial_names.is_empty() {
+                warnings.push(format!(
+                    "{} recovered {} validated in-progress WAV segment(s): {}",
+                    track.kind.as_str(),
+                    recoverable.partial_names.len(),
+                    recoverable.partial_names.join(", ")
+                ));
             }
             let checkpoint = checkpoints
                 .get(track.kind.as_str())
@@ -1422,7 +1650,7 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
                 kind: track.kind,
                 device_id: track.device_id.clone(),
                 channels: track.channels,
-                segment_paths: segments,
+                segment_paths: recoverable.paths,
                 samples_written: frames.saturating_mul(track.channels as u64),
                 dropped_packets: checkpoint.dropped_packets,
                 discontinuities: checkpoint.discontinuities,
@@ -1531,13 +1759,99 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
         } else {
             None
         };
+        let screen_directory = core
+            .layout()
+            .recordings()
+            .join(&meeting_id)
+            .join(&session_id)
+            .join("screen");
+        let screen_recovery = if config.capture_screen {
+            match recoverable_screen_segments(core.layout(), &screen_directory, started_at_ms) {
+                Ok(recovery) => {
+                    warnings.extend(recovery.warnings.iter().cloned());
+                    Some(recovery)
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "Screen capture directory could not be recovered: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut screen_asset = None;
+        if let Some(recovery) = screen_recovery.as_ref() {
+            if recovery.summary.segments.is_empty() {
+                warnings.push(
+                    "No validated screen capture segments were recoverable even though screen \
+                     recording was enabled"
+                        .into(),
+                );
+            } else {
+                match consolidate_screen(
+                    core.layout(),
+                    &meeting_id,
+                    &session_id,
+                    &recovery.summary,
+                    true,
+                ) {
+                    Ok(mut asset) => {
+                        asset.id = stable_recovery_id(&format!("recording:{session_id}:screen"));
+                        let output_duration_ms = asset.duration_ms.unwrap_or_default();
+                        let recovered_content_duration_ms = output_duration_ms
+                            .saturating_sub(recovery.estimated_start_offset_ms.unwrap_or_default());
+                        let duration_loss_ms = recovery
+                            .source_duration_ms
+                            .saturating_sub(recovered_content_duration_ms);
+                        warnings.push(format!(
+                            "Screen recording recovered from {} validated capture segment(s) \
+                             ({} in-progress .mp4.partial) and re-encoded to managed H.264 \
+                             screen.mp4",
+                            recovery.source_names.len(),
+                            recovery.partial_names.len()
+                        ));
+                        if duration_loss_ms > 1_000 {
+                            warnings.push(format!(
+                                "Recovered screen output is approximately {duration_loss_ms} ms \
+                                 shorter than the probed source fragments; a corrupt trailing \
+                                 fragment may have been discarded during re-encoding"
+                            ));
+                        }
+                        screen_asset = Some(asset);
+                    }
+                    Err(error) => warnings.push(format!(
+                        "Screen capture segments could not be consolidated: {error}"
+                    )),
+                }
+            }
+        }
         let duration_ms = recovered_assets
             .iter()
             .filter_map(|(_, _, _, asset)| asset.duration_ms)
             .chain(playback.iter().filter_map(|asset| asset.duration_ms))
+            .chain(screen_asset.iter().filter_map(|asset| asset.duration_ms))
             .max()
             .unwrap_or_default();
-        let ended_at_ms = now_ms();
+        let recovery_observed_at_ms = now_ms();
+        let recovery_source_paths = recovered_assets
+            .iter()
+            .flat_map(|(_, summary, _, _)| summary.segment_paths.iter().cloned())
+            .chain(
+                screen_recovery
+                    .iter()
+                    .flat_map(|recovery| recovery.summary.segments.iter())
+                    .map(|segment| segment.path.clone()),
+            )
+            .collect::<Vec<_>>();
+        let ended_at_ms = derive_recovery_ended_at_ms(
+            started_at_ms,
+            duration_ms,
+            paused_duration_ms,
+            recovery_observed_at_ms,
+            &recovery_source_paths,
+        );
         let warning = warnings.join("; ");
         let has_audio = !recovered_assets.is_empty();
         let complete = has_audio && missing.is_empty();
@@ -1569,6 +1883,9 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
             )?;
         }
         if let Some(asset) = playback.as_mut() {
+            asset.id = ensure_recording_asset(&transaction, &meeting_id, asset, ended_at_ms)?;
+        }
+        if let Some(asset) = screen_asset.as_mut() {
             asset.id = ensure_recording_asset(&transaction, &meeting_id, asset, ended_at_ms)?;
         }
         transaction.execute(
@@ -1604,9 +1921,25 @@ pub(crate) fn recover_interrupted_recordings(core: &CoreService) -> CoreResult<u
             json!({
                 "type":"recording_recovered",
                 "endedAtMs":ended_at_ms,
+                "recoveryObservedAtMs":recovery_observed_at_ms,
                 "complete":complete,
                 "assets":recovered_assets.iter().map(|(_,_,_,asset)| &asset.id).collect::<Vec<_>>(),
                 "playbackAsset":playback.as_ref().map(|asset| &asset.id),
+                "screenAsset":screen_asset.as_ref().map(|asset| &asset.id),
+                "screenRecovery":screen_recovery.as_ref().map(|recovery| json!({
+                    "sourceFiles":recovery.source_names,
+                    "partialSourceFiles":recovery.partial_names,
+                    "sourceDurationMs":recovery.source_duration_ms,
+                    "filesystemStartOffsetMs":recovery.filesystem_start_offset_ms,
+                    "estimatedStartOffsetMs":recovery.estimated_start_offset_ms,
+                    "outputDurationMs":screen_asset.as_ref().and_then(|asset| asset.duration_ms),
+                    "outputCodec":screen_asset.as_ref().and_then(|asset| asset.codec.as_deref()),
+                    "validation":if screen_asset.is_some() {
+                        "each source was probed as video; output was re-encoded, probed as H.264, and strict-decoded before publication"
+                    } else {
+                        "source discovery or output validation did not produce a publishable screen asset"
+                    }
+                })),
                 "warning":warning,
             }),
         ) {
@@ -1680,47 +2013,323 @@ fn nonzero_json_u64(value: Option<&Value>) -> Option<u64> {
     value.and_then(Value::as_u64).filter(|value| *value > 0)
 }
 
-fn recoverable_wav_segments(directory: &Path) -> CoreResult<Vec<PathBuf>> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
+fn recovery_segment_sequence(
+    path: &Path,
+    prefix: &str,
+    finalized_suffix: &str,
+    partial_suffix: &str,
+) -> Option<(u32, bool)> {
+    let name = path.file_name()?.to_str()?;
+    let (number, partial) = if let Some(value) = name
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(partial_suffix))
+    {
+        (value, true)
+    } else {
+        (
+            name.strip_prefix(prefix)?.strip_suffix(finalized_suffix)?,
+            false,
+        )
     };
-    let mut paths = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension().and_then(|value| value.to_str()) == Some("wav")
-                && path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|name| name.starts_with("segment-"))
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    Ok(paths)
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok().map(|sequence| (sequence, partial))
 }
 
-fn validate_recovery_segments(paths: &[PathBuf], channels: u16) -> CoreResult<u64> {
-    let mut frames = 0_u64;
-    for path in paths {
-        let reader = hound::WavReader::open(path).map_err(|error| {
-            CoreError::Audio(format!("recovered WAV segment is invalid: {error}"))
-        })?;
-        let spec = reader.spec();
-        if spec.sample_rate != CAPTURE_SAMPLE_RATE
-            || spec.channels != channels
-            || spec.bits_per_sample != 16
-            || spec.sample_format != hound::SampleFormat::Int
-        {
-            return Err(CoreError::Audio(format!(
-                "recovered WAV segment {:?} has an unexpected format",
-                path
-            )));
+fn recovery_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn recoverable_wav_segments(directory: &Path, channels: u16) -> CoreResult<RecoverableAudio> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecoverableAudio {
+                paths: Vec::new(),
+                frames: 0,
+                partial_names: Vec::new(),
+                warnings: Vec::new(),
+            })
         }
-        frames = frames.saturating_add(reader.duration() as u64);
+        Err(error) => return Err(error.into()),
+    };
+    let mut candidates = BTreeMap::<u32, RecoverySegmentCandidates>::new();
+    for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+        let Some((sequence, partial)) =
+            recovery_segment_sequence(&path, "segment-", ".wav", ".wav.partial")
+        else {
+            continue;
+        };
+        let candidate = candidates.entry(sequence).or_default();
+        if partial {
+            candidate.partial = Some(path);
+        } else {
+            candidate.finalized = Some(path);
+        }
+    }
+
+    let mut paths = Vec::new();
+    let mut frames = 0_u64;
+    let mut partial_names = Vec::new();
+    let mut warnings = Vec::new();
+    for (sequence, candidate) in candidates {
+        let mut accepted = None;
+        for (path, partial) in candidate
+            .finalized
+            .iter()
+            .map(|path| (path, false))
+            .chain(candidate.partial.iter().map(|path| (path, true)))
+        {
+            match validate_recovery_wav_segment(path, channels) {
+                Ok(path_frames) => {
+                    accepted = Some((path.clone(), partial, path_frames));
+                    break;
+                }
+                Err(error) => warnings.push(format!(
+                    "segment {sequence} candidate {} was rejected: {error}",
+                    recovery_file_name(path)
+                )),
+            }
+        }
+        if let Some((path, partial, path_frames)) = accepted {
+            if partial {
+                partial_names.push(recovery_file_name(&path));
+            }
+            paths.push(path);
+            frames = frames.saturating_add(path_frames);
+        }
+    }
+    Ok(RecoverableAudio {
+        paths,
+        frames,
+        partial_names,
+        warnings,
+    })
+}
+
+fn validate_recovery_wav_segment(path: &Path, channels: u16) -> CoreResult<u64> {
+    let reader = hound::WavReader::open(path)
+        .map_err(|error| CoreError::Audio(format!("WAV is invalid: {error}")))?;
+    let spec = reader.spec();
+    if spec.sample_rate != CAPTURE_SAMPLE_RATE
+        || spec.channels != channels
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return Err(CoreError::Audio(format!(
+            "WAV has an unexpected format (expected {CAPTURE_SAMPLE_RATE} Hz, {channels} \
+             channel(s), signed 16-bit PCM)"
+        )));
+    }
+    let frames = reader.duration() as u64;
+    if frames == 0 {
+        return Err(CoreError::Audio("WAV contains no audio frames".into()));
     }
     Ok(frames)
+}
+
+fn recoverable_screen_segments(
+    layout: &crate::layout::AppLayout,
+    directory: &Path,
+    session_started_at_ms: i64,
+) -> CoreResult<RecoverableScreen> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecoverableScreen {
+                summary: ScreenCaptureSummary::default(),
+                source_names: Vec::new(),
+                partial_names: Vec::new(),
+                source_duration_ms: 0,
+                filesystem_start_offset_ms: None,
+                estimated_start_offset_ms: None,
+                warnings: Vec::new(),
+            })
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut candidates = BTreeMap::<u32, RecoverySegmentCandidates>::new();
+    for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+        let Some((sequence, partial)) =
+            recovery_segment_sequence(&path, "screen-segment-", ".mp4", ".mp4.partial")
+        else {
+            continue;
+        };
+        let candidate = candidates.entry(sequence).or_default();
+        if partial {
+            candidate.partial = Some(path);
+        } else {
+            candidate.finalized = Some(path);
+        }
+    }
+
+    let mut accepted = Vec::<(u32, PathBuf, bool, i64)>::new();
+    let mut warnings = Vec::new();
+    for (sequence, candidate) in candidates {
+        let mut selected = None;
+        for (path, partial) in candidate
+            .finalized
+            .iter()
+            .map(|path| (path, false))
+            .chain(candidate.partial.iter().map(|path| (path, true)))
+        {
+            match media::probe_unpublished_visual(layout, path) {
+                Ok(probe) => match probe.duration_ms.filter(|duration| *duration > 0) {
+                    Some(duration_ms) => {
+                        selected = Some((sequence, path.clone(), partial, duration_ms));
+                        break;
+                    }
+                    None => warnings.push(format!(
+                        "Screen segment {} was rejected because it has no positive duration",
+                        recovery_file_name(path)
+                    )),
+                },
+                Err(error) => warnings.push(format!(
+                    "Screen segment {} was rejected by FFprobe: {error}",
+                    recovery_file_name(path)
+                )),
+            }
+        }
+        if let Some(selected) = selected {
+            accepted.push(selected);
+        }
+    }
+
+    let filesystem_start_offset_ms = accepted
+        .first()
+        .and_then(|(_, path, _, _)| file_created_at_ms(path))
+        .map(|created_at_ms| created_at_ms.saturating_sub(session_started_at_ms));
+    let (estimated_start_offset_ms, alignment_warning) =
+        bounded_recovered_screen_start_offset(filesystem_start_offset_ms);
+    if !accepted.is_empty() {
+        warnings.push(alignment_warning);
+        if accepted.len() > 1 {
+            warnings.push(
+                "Recovered screen capture contains multiple segments; inter-segment pause timing \
+                 is approximate and pause gaps are collapsed in the consolidated video"
+                    .into(),
+            );
+        }
+    }
+
+    let mut source_names = Vec::new();
+    let mut partial_names = Vec::new();
+    let mut segments = Vec::new();
+    let mut timeline_ms = estimated_start_offset_ms.unwrap_or_default();
+    let mut source_duration_ms = 0_i64;
+    for (sequence, path, partial, duration_ms) in accepted {
+        let name = recovery_file_name(&path);
+        source_names.push(name.clone());
+        if partial {
+            partial_names.push(name.clone());
+        }
+        segments.push(screen_capture::ScreenSegmentSummary {
+            sequence,
+            path,
+            timeline_start_ms: timeline_ms,
+            duration_ms,
+            frame_count: ((duration_ms as u64).saturating_mul(5) / 1_000).max(1),
+            qpc_first: None,
+            qpc_last: None,
+            stderr_log: Some(format!(
+                "Recovered from {name}; the original capture fragment was retained"
+            )),
+        });
+        source_duration_ms = source_duration_ms.saturating_add(duration_ms);
+        timeline_ms = timeline_ms.saturating_add(duration_ms);
+    }
+    Ok(RecoverableScreen {
+        summary: ScreenCaptureSummary {
+            segments,
+            warning: None,
+        },
+        source_names,
+        partial_names,
+        source_duration_ms,
+        filesystem_start_offset_ms,
+        estimated_start_offset_ms,
+        warnings,
+    })
+}
+
+fn file_created_at_ms(path: &Path) -> Option<i64> {
+    system_time_ms(fs::metadata(path).ok()?.created().ok()?)
+}
+
+fn file_modified_at_ms(path: &Path) -> Option<i64> {
+    system_time_ms(fs::metadata(path).ok()?.modified().ok()?)
+}
+
+fn derive_recovery_ended_at_ms(
+    started_at_ms: i64,
+    duration_ms: i64,
+    paused_duration_ms: i64,
+    recovery_observed_at_ms: i64,
+    source_paths: &[PathBuf],
+) -> i64 {
+    let upper_bound_ms = recovery_observed_at_ms.max(0);
+    let lower_bound_ms = started_at_ms.clamp(0, upper_bound_ms);
+    let duration_end_ms = started_at_ms
+        .saturating_add(duration_ms.max(0))
+        .saturating_add(paused_duration_ms.max(0))
+        .clamp(lower_bound_ms, upper_bound_ms);
+    let latest_source_mtime_ms = source_paths
+        .iter()
+        .filter_map(|path| file_modified_at_ms(path))
+        .filter(|modified_at_ms| {
+            (*modified_at_ms >= lower_bound_ms) && (*modified_at_ms <= upper_bound_ms)
+        })
+        .max();
+    match latest_source_mtime_ms {
+        Some(modified_at_ms)
+            if modified_at_ms.abs_diff(duration_end_ms)
+                <= RECOVERY_END_MTIME_TOLERANCE_MS as u64 =>
+        {
+            modified_at_ms
+        }
+        _ => duration_end_ms,
+    }
+}
+
+fn bounded_recovered_screen_start_offset(raw_offset_ms: Option<i64>) -> (Option<i64>, String) {
+    match raw_offset_ms {
+        Some(raw_offset_ms) if raw_offset_ms < 0 => (
+            Some(0),
+            format!(
+                "Recovered screen filesystem start offset {raw_offset_ms} ms predates the session; \
+                 it was rejected and clamped to 0 ms, and alignment requires review"
+            ),
+        ),
+        Some(raw_offset_ms) if raw_offset_ms > MAX_RECOVERED_SCREEN_START_OFFSET_MS => (
+            Some(MAX_RECOVERED_SCREEN_START_OFFSET_MS),
+            format!(
+                "Recovered screen filesystem start offset {raw_offset_ms} ms exceeds the plausible \
+                 {MAX_RECOVERED_SCREEN_START_OFFSET_MS} ms startup bound; it was clamped, and \
+                 alignment requires review"
+            ),
+        ),
+        Some(raw_offset_ms) => (
+            Some(raw_offset_ms),
+            format!(
+                "Recovered screen start alignment is estimated at {raw_offset_ms} ms from \
+                 filesystem creation metadata and requires review"
+            ),
+        ),
+        None => (
+            None,
+            "Recovered screen start alignment could not be reconstructed exactly and requires \
+             review"
+                .into(),
+        ),
+    }
+}
+
+fn system_time_ms(value: SystemTime) -> Option<i64> {
+    let millis = value.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    i64::try_from(millis).ok()
 }
 
 fn consolidate_recovery_wav(
@@ -1796,15 +2405,33 @@ fn ensure_recording_asset(
     asset: &ConsolidatedAsset,
     created_at_ms: i64,
 ) -> CoreResult<String> {
-    if let Some(existing) = transaction
+    if let Some((existing_id, existing_meeting_id, existing_kind, existing_path)) = transaction
         .query_row(
-            "SELECT id FROM media_assets WHERE relative_path=?1",
-            [&asset.relative_path],
-            |row| row.get::<_, String>(0),
+            "SELECT id,meeting_id,kind,relative_path FROM media_assets
+             WHERE id=?1 OR relative_path=?2",
+            params![asset.id, asset.relative_path],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
         )
         .optional()?
     {
-        return Ok(existing);
+        if existing_id != asset.id
+            || existing_meeting_id != meeting_id
+            || existing_kind != asset.kind
+            || existing_path != asset.relative_path
+        {
+            return Err(CoreError::Conflict(format!(
+                "recovery asset {} conflicts with an existing managed media row",
+                asset.id
+            )));
+        }
+        return Ok(existing_id);
     }
     insert_recording_asset(transaction, meeting_id, asset, created_at_ms)?;
     Ok(asset.id.clone())
@@ -1864,6 +2491,177 @@ struct ConsolidatedAsset {
     channels: Option<u16>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ScreenPlaybackBackfillReport {
+    pub source_asset_id: String,
+    pub meeting_id: String,
+    pub playback_asset_id: Option<String>,
+    pub warning: Option<String>,
+}
+
+impl ScreenPlaybackBackfillReport {
+    pub(crate) fn created(&self) -> bool {
+        self.playback_asset_id.is_some()
+    }
+}
+
+struct ScreenPlaybackSource {
+    id: String,
+    meeting_id: String,
+    relative_path: String,
+}
+
+/// Create one H.264 playback derivative for a ready meeting whose original
+/// screen capture is MPEG-4 Part 2. The original screen asset remains intact so
+/// visual-context provenance and recovery evidence never change underneath it.
+///
+/// The coordinator supplies source IDs already attempted in this process. That
+/// prevents a permanently bad source or missing Media Foundation codec from
+/// creating a tight retry loop while still allowing transient filesystem or DB
+/// failures to recover. Successful rows and paths are deterministic/idempotent.
+pub(crate) fn backfill_next_screen_playback(
+    core: &CoreService,
+    attempted_source_ids: &BTreeMap<String, i64>,
+) -> CoreResult<Option<ScreenPlaybackBackfillReport>> {
+    let now = now_ms();
+    let connection = core.database().connect()?;
+    let mut statement = connection.prepare(
+        "SELECT source.id,source.meeting_id,source.relative_path
+         FROM media_assets source
+         JOIN meetings meeting ON meeting.id=source.meeting_id
+         WHERE source.kind='screen'
+           AND meeting.status='ready'
+           AND COALESCE(lower(source.codec),'')<>'h264'
+           AND NOT EXISTS (
+                SELECT 1 FROM media_assets playback
+                WHERE playback.meeting_id=source.meeting_id
+                  AND playback.kind='screen_playback'
+           )
+         ORDER BY meeting.created_at_ms DESC,source.created_at_ms DESC,source.id DESC",
+    )?;
+    let candidates = statement.query_map([], |row| {
+        Ok(ScreenPlaybackSource {
+            id: row.get(0)?,
+            meeting_id: row.get(1)?,
+            relative_path: row.get(2)?,
+        })
+    })?;
+    let mut candidate = None;
+    for row in candidates {
+        let row = row?;
+        let retry_ready = attempted_source_ids
+            .get(&row.id)
+            .map(|attempted_at| now.saturating_sub(*attempted_at) >= SCREEN_PLAYBACK_RETRY_DELAY_MS)
+            .unwrap_or(true);
+        if retry_ready {
+            candidate = Some(row);
+            break;
+        }
+    }
+    drop(statement);
+    drop(connection);
+    let Some(source) = candidate else {
+        return Ok(None);
+    };
+
+    let source_asset_id = source.id.clone();
+    let meeting_id = source.meeting_id.clone();
+    let result = create_screen_playback_derivative(core, source);
+    Ok(Some(match result {
+        Ok(asset_id) => ScreenPlaybackBackfillReport {
+            source_asset_id,
+            meeting_id,
+            playback_asset_id: Some(asset_id),
+            warning: None,
+        },
+        Err(error) => ScreenPlaybackBackfillReport {
+            source_asset_id,
+            meeting_id,
+            playback_asset_id: None,
+            warning: Some(error.to_string()),
+        },
+    }))
+}
+
+fn create_screen_playback_derivative(
+    core: &CoreService,
+    source: ScreenPlaybackSource,
+) -> CoreResult<String> {
+    let source_path = core.layout().resolve_relative(&source.relative_path)?;
+    let directory = source_path.parent().ok_or_else(|| {
+        CoreError::InvalidInput("screen recording path has no parent directory".into())
+    })?;
+    let destination = directory.join("screen-playback.mp4");
+    let probe = match media::probe_visual(core.layout(), &destination) {
+        Ok(probe) if media::require_webview_h264(&probe).is_ok() => probe,
+        _ => media::transcode_visual_for_webview(core.layout(), &source_path, &destination)?,
+    };
+    media::require_webview_h264(&probe)?;
+    persist_screen_playback_derivative(core, &source, &destination, &probe)
+}
+
+fn persist_screen_playback_derivative(
+    core: &CoreService,
+    source: &ScreenPlaybackSource,
+    destination: &Path,
+    probe: &media::MediaProbe,
+) -> CoreResult<String> {
+    let relative_path = core.layout().relative_to_root(&destination)?;
+    let asset_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("saytrace:screen-playback:h264-mf:v1:{}", source.id).as_bytes(),
+    )
+    .to_string();
+    let size_bytes = fs::metadata(&destination)?.len();
+    let sha256 = media::sha256_file(&destination)?;
+    let now = now_ms();
+    let mut connection = core.database().connect()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = transaction
+        .query_row(
+            "SELECT id,meeting_id,kind FROM media_assets
+             WHERE id=?1 OR relative_path=?2",
+            params![asset_id, relative_path],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((existing_id, existing_meeting_id, existing_kind)) = existing {
+        if existing_meeting_id != source.meeting_id || existing_kind != "screen_playback" {
+            return Err(CoreError::Conflict(
+                "screen playback destination is already registered to another asset".into(),
+            ));
+        }
+        transaction.commit()?;
+        return Ok(existing_id);
+    }
+    transaction.execute(
+        "INSERT INTO media_assets(
+            id,meeting_id,kind,display_name,relative_path,content_type,size_bytes,sha256,
+            duration_ms,codec,sample_rate_hz,channels,created_at_ms
+         ) VALUES (?1,?2,'screen_playback','screen-playback.mp4',?3,?4,?5,?6,
+                   ?7,?8,NULL,NULL,?9)",
+        params![
+            asset_id,
+            source.meeting_id,
+            relative_path,
+            probe.content_type,
+            size_bytes as i64,
+            sha256,
+            probe.duration_ms,
+            probe.codec,
+            now
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(asset_id)
+}
+
 fn consolidate_track(
     layout: &crate::layout::AppLayout,
     meeting_id: &str,
@@ -1917,6 +2715,116 @@ fn consolidate_track(
     fs::rename(partial, &destination)?;
     let _ = fs::remove_file(list_path);
     consolidated_from_path(layout, destination, kind.into(), format!("{kind}.flac"))
+}
+
+fn consolidate_screen(
+    layout: &crate::layout::AppLayout,
+    meeting_id: &str,
+    session_id: &str,
+    summary: &ScreenCaptureSummary,
+    strict_recovery_validation: bool,
+) -> CoreResult<ConsolidatedAsset> {
+    if summary.segments.is_empty() {
+        return Err(CoreError::Media(
+            "screen capture did not produce any finalized segments".into(),
+        ));
+    }
+    let directory = layout.recordings().join(meeting_id).join(session_id);
+    let list_path = directory.join("screen-segments.txt");
+    let list = summary
+        .segments
+        .iter()
+        .map(|segment| {
+            format!(
+                "file '{}'\n",
+                segment.path.to_string_lossy().replace('\'', "'\\''")
+            )
+        })
+        .collect::<String>();
+    fs::write(&list_path, list)?;
+    let destination = directory.join("screen.mp4");
+    let video_filter = if summary.start_offset_ms() > 0 {
+        format!(
+            "setpts=PTS-STARTPTS,tpad=start_mode=clone:start_duration={:.3}",
+            summary.start_offset_ms() as f64 / 1_000.0
+        )
+    } else {
+        "setpts=PTS-STARTPTS".into()
+    };
+    let partial = PathBuf::from(format!("{}.partial", destination.to_string_lossy()));
+    let _ = fs::remove_file(&partial);
+    let mut arguments = vec![
+        "-y".into(),
+        "-v".into(),
+        "error".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        list_path.to_string_lossy().into_owned(),
+        "-an".into(),
+        "-vf".into(),
+        video_filter,
+        "-fps_mode".into(),
+        "cfr".into(),
+        "-r".into(),
+        "5".into(),
+    ];
+    arguments.extend(
+        media::webview_h264_encoder_args()
+            .iter()
+            .map(|argument| (*argument).to_string()),
+    );
+    arguments.push(partial.to_string_lossy().into_owned());
+    let result = (|| -> CoreResult<ConsolidatedAsset> {
+        run_ffmpeg_owned(layout, &arguments)?;
+        let probe = media::probe_unpublished_visual(layout, &partial)?;
+        media::require_webview_h264(&probe)?;
+        if probe.duration_ms.unwrap_or_default() <= 0 {
+            return Err(CoreError::Media(
+                "recovered screen output has no positive duration".into(),
+            ));
+        }
+        if strict_recovery_validation {
+            validate_recovered_screen_output(layout, &partial)?;
+        }
+        let _ = fs::remove_file(&destination);
+        fs::rename(&partial, &destination)?;
+        consolidated_visual_from_path(layout, destination, "screen.mp4".into())
+    })();
+    let _ = fs::remove_file(&list_path);
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    result
+}
+
+fn validate_recovered_screen_output(
+    layout: &crate::layout::AppLayout,
+    path: &Path,
+) -> CoreResult<()> {
+    run_ffmpeg_owned(
+        layout,
+        &[
+            "-v".into(),
+            "error".into(),
+            "-xerror".into(),
+            "-i".into(),
+            path.to_string_lossy().into_owned(),
+            "-map".into(),
+            "0:v:0".into(),
+            "-an".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ],
+    )
+    .map_err(|error| {
+        CoreError::Media(format!(
+            "recovered H.264 screen output failed strict decode validation: {error}"
+        ))
+    })
 }
 
 fn mix_tracks(
@@ -1983,6 +2891,29 @@ fn consolidated_from_path(
         codec: probe.codec,
         sample_rate_hz: probe.sample_rate_hz,
         channels: probe.channels,
+        path,
+    })
+}
+
+fn consolidated_visual_from_path(
+    layout: &crate::layout::AppLayout,
+    path: PathBuf,
+    display_name: String,
+) -> CoreResult<ConsolidatedAsset> {
+    let probe = media::probe_visual(layout, &path)?;
+    media::require_webview_h264(&probe)?;
+    Ok(ConsolidatedAsset {
+        id: new_id(),
+        kind: "screen".into(),
+        display_name,
+        relative_path: layout.relative_to_root(&path)?,
+        content_type: probe.content_type,
+        size_bytes: fs::metadata(&path)?.len(),
+        sha256: media::sha256_file(&path)?,
+        duration_ms: probe.duration_ms,
+        codec: probe.codec,
+        sample_rate_hz: None,
+        channels: None,
         path,
     })
 }
@@ -2075,6 +3006,32 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+
+    const H264_MP4_FIXTURE_BASE64: &str = concat!(
+        "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMqbW9vdgAAAGxtdmhkAAAAAAAA",
+        "AAAAAAAAAAAD6AAAAZAAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA",
+        "AAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAlV0cmFrAAAAXHRraGQAAAAD",
+        "AAAAAAAAAAAAAAABAAAAAAAAAZAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAA",
+        "AAAAAAAAAAAAAABAAAAAAEAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAGQAAAAAAAB",
+        "AAAAAAHNbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAAoAAAAEABVxAAAAAAALWhkbHIAAAAAAAAA",
+        "AHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABeG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAA",
+        "AAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAThzdGJsAAAAuHN0c2QAAAAA",
+        "AAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAEAAQABIAAAASAAAAAAAAAABFUxh",
+        "dmM2MS4xOS4xMDEgaDI2NF9tZgAAAAAAAAAAAAAAGP//AAAALmF2Y0MBQsAL/+EAF2dCwAuVoQ",
+        "mhAAADAAEAAAMACg2giEagAQAEaM48gAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAAw1A",
+        "AAAdTAAAABhzdHRzAAAAAAAAAAEAAAACAAAIAAAAABRzdHNzAAAAAAAAAAEAAAABAAAAHHN0c2MA",
+        "AAAAAAAAAQAAAAEAAAACAAAAAQAAABxzdHN6AAAAAAAAAAAAAAACAAABZgAAABEAAAAUc3RjbwAA",
+        "AAAAAAABAAADWgAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAA",
+        "AAAAAAAAAAAALGlsc3QAAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjEuNy4xMDMAAAAIZnJl",
+        "ZQAAAX9tZGF0AAAAAgkQAAAAF2dCwAuVoQmhAAADAAEAAAMACg2giEagAAAABGjOPIAAAAAzBgUv",
+        "AvhhUPxwQXK3Mkjzpyo9NE1pY3Jvc29mdCBILjI2NCBFbmNvZGVyIFYxLjUuMwCAAAAA4wYF38uy",
+        "E5KYc0PaqKbHQpg1bPVzcmM6MyBoOjY0IHc6NjQgZnBzOjUuMDAwIHBmOjY2IGx2bDoyIGI6MCBi",
+        "cXA6MyBnb3A6NSBpZHI6NSBzbGM6MSBjbXA6MCByYzowIHFwOjI2IHJhdGU6MjAwMDAwIHBlYWs6",
+        "MCBidWZmOjAgcmVmOjEgc3JjaDozMiBhc3JjaDoxIHN1YnA6MSBwYXI6NiAzIDMgcm5kOjAgY2Fi",
+        "YWM6MCBscDoyIGN0bnQ6MCBhdWQ6MSBsYXQ6MCB3cms6OCB2dWk6MSBseXI6MSA8PACAAAAAG2WI",
+        "gEEP///D0UAAQC/e73fW63XXW66666668AAAAAIJMAAAAAdhmgOCHhGA"
+    );
 
     fn summary(
         channels: u16,
@@ -2097,6 +3054,288 @@ mod tests {
         }
     }
 
+    fn write_test_wav(path: &Path, channels: u16, frames: u32) {
+        let mut writer = hound::WavWriter::create(
+            path,
+            hound::WavSpec {
+                channels,
+                sample_rate: CAPTURE_SAMPLE_RATE,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..frames.saturating_mul(channels as u32) {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_truncated_fragmented_h264_test_capture(
+        core: &CoreService,
+        destination: &Path,
+    ) -> CoreResult<()> {
+        let ffmpeg = media_tools::resolve(core.layout(), MediaTool::Ffmpeg)?;
+        let complete = destination.with_file_name("complete-fragmented-fixture.mp4");
+        let mut arguments = [
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=5:duration=4.2",
+            "-an",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        arguments.extend(
+            media::webview_h264_encoder_args()
+                .iter()
+                .map(|argument| (*argument).to_string()),
+        );
+        arguments.extend([
+            "-movflags".into(),
+            "+frag_keyframe+empty_moov+default_base_moof".into(),
+            "-f".into(),
+            "mp4".into(),
+            complete.to_string_lossy().into_owned(),
+        ]);
+        let output = Command::new(ffmpeg)
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| CoreError::Media(format!("test FFmpeg could not start: {error}")))?;
+        if !output.status.success() {
+            return Err(CoreError::Media(format!(
+                "test FFmpeg could not create Media Foundation fixture: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        validate_recovered_screen_output(core.layout(), &complete)?;
+        let bytes = fs::read(&complete)?;
+        let cuts = [64_usize, 128, 256, 512, 1_024, 2_048, 4_096, 8_192];
+        for cut in cuts {
+            if bytes.len() <= cut + 1_024 {
+                continue;
+            }
+            fs::write(destination, &bytes[..bytes.len() - cut])?;
+            if media::probe_unpublished_visual(core.layout(), destination).is_ok()
+                && validate_recovered_screen_output(core.layout(), destination).is_err()
+            {
+                let _ = fs::remove_file(&complete);
+                return Ok(());
+            }
+        }
+        let _ = fs::remove_file(&complete);
+        Err(CoreError::Media(
+            "test fixture could not be truncated into a probeable but strict-decode-invalid MP4"
+                .into(),
+        ))
+    }
+
+    fn insert_screen_playback_source(
+        core: &CoreService,
+        status: &str,
+        codec: &str,
+        created_at_ms: i64,
+    ) -> (String, String, PathBuf) {
+        let meeting_id = Uuid::now_v7().to_string();
+        let asset_id = Uuid::now_v7().to_string();
+        let path = core
+            .layout()
+            .recordings()
+            .join(&meeting_id)
+            .join("screen.mp4");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"preserve the original screen recording").unwrap();
+        let relative_path = core.layout().relative_to_root(&path).unwrap();
+        let connection = core.database().connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO meetings(id,title,source_kind,status,created_at_ms)
+                 VALUES (?1,'Screen playback','recording',?2,?3)",
+                params![meeting_id, status, created_at_ms],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO media_assets(
+                    id,meeting_id,kind,display_name,relative_path,content_type,size_bytes,
+                    sha256,duration_ms,codec,created_at_ms
+                 ) VALUES (?1,?2,'screen','screen.mp4',?3,'video/mp4',38,'source-hash',
+                           1000,?4,?5)",
+                params![asset_id, meeting_id, relative_path, codec, created_at_ms],
+            )
+            .unwrap();
+        (asset_id, meeting_id, path)
+    }
+
+    #[test]
+    fn screen_playback_backfill_rate_limits_failed_sources_without_starving_others() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = CoreService::open(temp.path()).unwrap();
+        let (older_id, _, _) = insert_screen_playback_source(&core, "ready", "mpeg4", 10);
+        let (newer_id, _, newer_path) = insert_screen_playback_source(&core, "ready", "mpeg4", 20);
+        let _ = insert_screen_playback_source(&core, "processing", "mpeg4", 30);
+        let _ = insert_screen_playback_source(&core, "ready", "h264", 40);
+        let original = fs::read(&newer_path).unwrap();
+        let mut attempted = BTreeMap::new();
+
+        let first = backfill_next_screen_playback(&core, &attempted)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.source_asset_id, newer_id);
+        assert!(!first.created());
+        assert!(first.warning.is_some());
+        assert_eq!(fs::read(&newer_path).unwrap(), original);
+        attempted.insert(first.source_asset_id, now_ms());
+
+        let second = backfill_next_screen_playback(&core, &attempted)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.source_asset_id, older_id);
+        assert!(!second.created());
+        attempted.insert(second.source_asset_id, now_ms());
+
+        assert!(backfill_next_screen_playback(&core, &attempted)
+            .unwrap()
+            .is_none());
+
+        attempted.insert(
+            newer_id.clone(),
+            now_ms().saturating_sub(SCREEN_PLAYBACK_RETRY_DELAY_MS),
+        );
+        let retried = backfill_next_screen_playback(&core, &attempted)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.source_asset_id, newer_id);
+    }
+
+    #[test]
+    fn screen_playback_backfill_is_satisfied_by_an_existing_derivative() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = CoreService::open(temp.path()).unwrap();
+        let (_, meeting_id, source_path) =
+            insert_screen_playback_source(&core, "ready", "mpeg4", 10);
+        let playback_path = source_path.with_file_name("screen-playback.mp4");
+        fs::write(&playback_path, b"derived h264").unwrap();
+        let relative_path = core.layout().relative_to_root(&playback_path).unwrap();
+        let connection = core.database().connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO media_assets(
+                    id,meeting_id,kind,display_name,relative_path,content_type,size_bytes,
+                    sha256,duration_ms,codec,created_at_ms
+                 ) VALUES (?1,?2,'screen_playback','screen-playback.mp4',?3,'video/mp4',
+                           12,'playback-hash',1000,'h264',11)",
+                params![Uuid::now_v7().to_string(), meeting_id, relative_path],
+            )
+            .unwrap();
+
+        assert!(backfill_next_screen_playback(&core, &BTreeMap::new())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn screen_playback_persistence_is_explicit_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = CoreService::open(temp.path()).unwrap();
+        let (source_asset_id, meeting_id, source_path) =
+            insert_screen_playback_source(&core, "ready", "mpeg4", 10);
+        let destination = source_path.with_file_name("screen-playback.mp4");
+        fs::write(&destination, b"validated h264 derivative").unwrap();
+        let source = ScreenPlaybackSource {
+            id: source_asset_id,
+            meeting_id: meeting_id.clone(),
+            relative_path: core.layout().relative_to_root(&source_path).unwrap(),
+        };
+        let probe = media::MediaProbe {
+            kind: "video".into(),
+            content_type: "video/mp4".into(),
+            duration_ms: Some(1_000),
+            codec: Some("h264".into()),
+            sample_rate_hz: None,
+            channels: None,
+        };
+
+        let first =
+            persist_screen_playback_derivative(&core, &source, &destination, &probe).unwrap();
+        let second =
+            persist_screen_playback_derivative(&core, &source, &destination, &probe).unwrap();
+
+        assert_eq!(first, second);
+        let connection = core.database().connect().unwrap();
+        let row: (i64, String, String, i64, String) = connection
+            .query_row(
+                "SELECT count(*),kind,codec,duration_ms,relative_path
+                 FROM media_assets WHERE meeting_id=?1 AND kind='screen_playback'",
+                [&meeting_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1, "screen_playback");
+        assert_eq!(row.2, "h264");
+        assert_eq!(row.3, 1_000);
+        assert!(row.4.ends_with("screen-playback.mp4"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn screen_playback_backfill_adopts_orphan_from_resolved_extended_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = CoreService::open(temp.path()).unwrap();
+        let (_, meeting_id, source_path) =
+            insert_screen_playback_source(&core, "ready", "mpeg4", 10);
+        let orphan = source_path.with_file_name("screen-playback.mp4");
+        fs::write(
+            &orphan,
+            BASE64_STANDARD.decode(H264_MP4_FIXTURE_BASE64).unwrap(),
+        )
+        .unwrap();
+
+        let backfill = backfill_next_screen_playback(&core, &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(backfill.meeting_id, meeting_id);
+        assert!(
+            backfill.created(),
+            "backfill warning: {:?}",
+            backfill.warning
+        );
+        let connection = core.database().connect().unwrap();
+        let (kind, codec, relative_path): (String, String, String) = connection
+            .query_row(
+                "SELECT kind,codec,relative_path FROM media_assets
+                 WHERE meeting_id=?1 AND kind='screen_playback'",
+                [&meeting_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "screen_playback");
+        assert_eq!(codec, "h264");
+        assert!(relative_path.ends_with("screen-playback.mp4"));
+        assert_eq!(
+            fs::read(source_path).unwrap(),
+            b"preserve the original screen recording"
+        );
+    }
+
     #[test]
     fn elapsed_time_excludes_current_and_completed_pauses() {
         let recording = ActiveRecording {
@@ -2109,6 +3348,8 @@ mod tests {
             paused_total: Duration::from_secs(3),
             current_pause_id: None,
             tracks: Vec::new(),
+            screen_capture: None,
+            screen_warning: None,
             manifest_path: PathBuf::new(),
             monitor_stop: Arc::new(AtomicBool::new(false)),
             monitor_handle: None,
@@ -2238,7 +3479,7 @@ mod tests {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let shared = Arc::new(CaptureShared::default());
         shared.mark_live();
-        let recording = ActiveRecording {
+        let mut recording = ActiveRecording {
             id: "session".into(),
             meeting_id: "meeting".into(),
             state: RecordingState::Recording,
@@ -2254,6 +3495,8 @@ mod tests {
                 handle: None,
                 shared: shared.clone(),
             }],
+            screen_capture: None,
+            screen_warning: None,
             manifest_path: PathBuf::new(),
             monitor_stop: Arc::new(AtomicBool::new(false)),
             monitor_handle: None,
@@ -2263,7 +3506,17 @@ mod tests {
         };
         let healthy = status_from_active(&recording);
         assert!(healthy.microphone_active);
+        assert!(!healthy.screen_capture_active);
         assert!(healthy.warning.is_none());
+
+        recording.screen_warning = Some("screen encoder unavailable".into());
+        let screen_degraded = status_from_active(&recording);
+        assert_eq!(screen_degraded.state, RecordingState::Recording);
+        assert!(screen_degraded
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("screen encoder unavailable"));
 
         shared.mark_failed("device removed");
         let failed = status_from_active(&recording);
@@ -2299,6 +3552,228 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Could not pause microphone capture"));
+    }
+
+    #[test]
+    fn audio_recovery_prefers_finalized_sequence_and_accepts_unique_valid_partial() {
+        let temp = tempfile::tempdir().unwrap();
+        let finalized = temp.path().join("segment-00001.wav");
+        let duplicate_partial = temp.path().join("segment-00001.wav.partial");
+        let unique_partial = temp.path().join("segment-00002.wav.partial");
+        let invalid_partial = temp.path().join("segment-00003.wav.partial");
+        write_test_wav(&finalized, 1, 4_800);
+        write_test_wav(&duplicate_partial, 1, 9_600);
+        write_test_wav(&unique_partial, 1, 2_400);
+        fs::write(&invalid_partial, b"not a wav").unwrap();
+        let finalized_before = fs::read(&finalized).unwrap();
+
+        let recovered = recoverable_wav_segments(temp.path(), 1).unwrap();
+
+        assert_eq!(
+            recovered.paths,
+            vec![finalized.clone(), unique_partial.clone()]
+        );
+        assert_eq!(recovered.frames, 7_200);
+        assert_eq!(recovered.partial_names, vec!["segment-00002.wav.partial"]);
+        assert_eq!(fs::read(&finalized).unwrap(), finalized_before);
+        assert!(duplicate_partial.exists());
+        assert!(recovered
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("segment-00003.wav.partial")));
+    }
+
+    #[test]
+    fn recovered_screen_start_offset_is_bounded_before_padding() {
+        let (offset, warning) = bounded_recovered_screen_start_offset(Some(86_400_000));
+        assert_eq!(offset, Some(MAX_RECOVERED_SCREEN_START_OFFSET_MS));
+        assert!(warning.contains("exceeds the plausible"));
+        assert!(warning.contains("clamped"));
+
+        let (offset, warning) = bounded_recovered_screen_start_offset(Some(-5_000));
+        assert_eq!(offset, Some(0));
+        assert!(warning.contains("predates the session"));
+        assert!(warning.contains("rejected"));
+    }
+
+    #[test]
+    fn recovered_end_time_uses_capture_duration_not_delayed_startup() {
+        let started_at_ms = 1_000_000;
+        let recovery_observed_at_ms = started_at_ms + 600_000;
+
+        let ended_at_ms =
+            derive_recovery_ended_at_ms(started_at_ms, 21_600, 3_000, recovery_observed_at_ms, &[]);
+        assert_eq!(ended_at_ms, started_at_ms + 24_600);
+
+        let bounded = derive_recovery_ended_at_ms(
+            started_at_ms,
+            i64::MAX,
+            i64::MAX,
+            recovery_observed_at_ms,
+            &[],
+        );
+        assert_eq!(bounded, recovery_observed_at_ms);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interrupted_fragmented_screen_partial_is_reencoded_persisted_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = CoreService::open(temp.path()).unwrap();
+        let meeting_id = new_id();
+        let session_id = new_id();
+        let track_id = new_id();
+        let started_at_ms = now_ms();
+        let session_directory = core
+            .layout()
+            .recordings()
+            .join(&meeting_id)
+            .join(&session_id);
+        let track_directory = session_directory.join("microphone");
+        let screen_directory = session_directory.join("screen");
+        fs::create_dir_all(&track_directory).unwrap();
+        fs::create_dir_all(&screen_directory).unwrap();
+        let audio_partial = track_directory.join("segment-00001.wav.partial");
+        write_test_wav(&audio_partial, 1, 4_800);
+        let screen_partial = screen_directory.join("screen-segment-00001.mp4.partial");
+        create_truncated_fragmented_h264_test_capture(&core, &screen_partial).unwrap();
+        assert!(
+            validate_recovered_screen_output(core.layout(), &screen_partial).is_err(),
+            "the interrupted source fixture must fail strict decode before recovery"
+        );
+        let source_hash = media::sha256_file(&screen_partial).unwrap();
+        let manifest = session_directory.join("recording-manifest.jsonl");
+        append_manifest(
+            &manifest,
+            json!({
+                "type":"recording_started",
+                "sessionId":session_id,
+                "meetingId":meeting_id,
+                "startedAtMs":started_at_ms
+            }),
+        )
+        .unwrap();
+        let config = RecordingConfig {
+            capture_system_audio: false,
+            capture_screen: true,
+            auto_screenshots: true,
+            visual_speaker_attribution: true,
+            ..Default::default()
+        };
+        let connection = core.database().connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO meetings(
+                    id,title,source_kind,status,created_at_ms,started_at_ms
+                 ) VALUES (?1,'Recovered screen','recording','recording',?2,?2)",
+                params![meeting_id, started_at_ms],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO recording_sessions(
+                    id,meeting_id,state,config_json,manifest_relative_path,started_at_ms
+                 ) VALUES (?1,?2,'recording',?3,?4,?5)",
+                params![
+                    session_id,
+                    meeting_id,
+                    serde_json::to_string(&config).unwrap(),
+                    core.layout().relative_to_root(&manifest).unwrap(),
+                    started_at_ms
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO recording_tracks(
+                    id,session_id,source_kind,device_id,relative_directory,
+                    sample_rate_hz,channels,created_at_ms
+                 ) VALUES (?1,?2,'microphone','mic',?3,?4,1,?5)",
+                params![
+                    track_id,
+                    session_id,
+                    core.layout().relative_to_root(&track_directory).unwrap(),
+                    CAPTURE_SAMPLE_RATE,
+                    started_at_ms
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(recover_interrupted_recordings(&core).unwrap(), 1);
+
+        let expected_screen_id = stable_recovery_id(&format!("recording:{session_id}:screen"));
+        let connection = core.database().connect().unwrap();
+        let (screen_id, kind, codec, duration_ms, relative_path): (
+            String,
+            String,
+            String,
+            i64,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT id,kind,codec,duration_ms,relative_path FROM media_assets
+                 WHERE meeting_id=?1 AND kind='screen'",
+                [&meeting_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let (session_state, job_count, screen_count): (String, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT state FROM recording_sessions WHERE id=?1),
+                    (SELECT count(*) FROM processing_jobs WHERE meeting_id=?2),
+                    (SELECT count(*) FROM media_assets
+                     WHERE meeting_id=?2 AND kind='screen')",
+                params![session_id, meeting_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(screen_id, expected_screen_id);
+        assert_eq!(kind, "screen");
+        assert_eq!(codec, "h264");
+        assert!(duration_ms >= 1_000);
+        assert!(relative_path.ends_with("screen.mp4"));
+        assert_eq!(session_state, "stopped");
+        assert_eq!(job_count, 1);
+        assert_eq!(screen_count, 1);
+        assert!(screen_partial.exists());
+        assert_eq!(media::sha256_file(&screen_partial).unwrap(), source_hash);
+        assert!(audio_partial.exists());
+        let warning = core
+            .get_meeting_summary(&meeting_id)
+            .unwrap()
+            .recovery_warning
+            .unwrap();
+        assert!(warning.contains("Screen recording recovered"));
+        assert!(warning.contains("in-progress .mp4.partial"));
+        assert!(warning.contains("alignment is estimated"));
+        let manifest_text = fs::read_to_string(&manifest).unwrap();
+        assert!(manifest_text.contains("screen-segment-00001.mp4.partial"));
+        assert!(manifest_text.contains("strict-decoded before publication"));
+
+        assert_eq!(recover_interrupted_recordings(&core).unwrap(), 0);
+        let connection = core.database().connect().unwrap();
+        let counts: (i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM media_assets
+                     WHERE meeting_id=?1 AND kind='screen'),
+                    (SELECT count(*) FROM processing_jobs WHERE meeting_id=?1)",
+                [&meeting_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
     }
 
     #[test]

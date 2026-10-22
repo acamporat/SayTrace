@@ -1,5 +1,6 @@
 import type {
   AppStatus,
+  ChatGptAgentStatus,
   AudioDevice,
   DeviceWarningEvent,
   DraftRevisionEvent,
@@ -93,13 +94,16 @@ export interface CommandMap {
     }>;
   };
   get_local_agent_status: { args: undefined; result: LocalAgentStatus };
+  get_chatgpt_agent_status: { args: undefined; result: ChatGptAgentStatus };
+  sign_in_chatgpt: { args: undefined; result: string };
+  sign_out_chatgpt: { args: undefined; result: void };
   list_transcript_chat: {
     args: { meetingId: string };
     result: TranscriptChatMessage[];
   };
   ask_transcript: {
     args: {
-      request: { meetingId: string; question: string; model?: string };
+      request: { meetingId: string; question: string; model?: string; provider?: "local" | "chatgpt"; cloudConsent?: boolean };
     };
     result: TranscriptChatMessage;
   };
@@ -163,6 +167,14 @@ export interface CommandMap {
     result: void;
   };
   list_voice_profiles: { args: undefined; result: VoiceProfile[] };
+  export_speaker_backup: {
+    args: undefined;
+    result: { path: string | null; profiles: number; samples: number; speakers: number };
+  };
+  import_speaker_backup: {
+    args: undefined;
+    result: { path: string | null; profiles: number; samples: number; speakers: number; skipped: number };
+  };
   create_voice_profile: {
     args: { name: string };
     result: VoiceProfile;
@@ -282,7 +294,10 @@ const approvedExternalUrls = new Set([
 ]);
 
 export async function openExternalUrl(url: string) {
-  if (!approvedExternalUrls.has(url)) {
+  const parsed = new URL(url);
+  const chatGptLogin = parsed.protocol === "https:" && !parsed.username && !parsed.password &&
+    !parsed.port && (parsed.hostname === "auth.openai.com" || parsed.hostname === "chatgpt.com");
+  if (!approvedExternalUrls.has(url) && !chatGptLogin) {
     throw new Error("This external link is not approved by SayTrace.");
   }
   if (isTauriRuntime()) {

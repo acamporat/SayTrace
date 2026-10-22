@@ -91,6 +91,19 @@ describe("SayTrace workspace", () => {
     await user.click(
       within(dialog).getByRole("button", { name: /record a meeting/i }),
     );
+    const confirmation = screen.getByRole("dialog", {
+      name: "Review before recording",
+    });
+    await user.click(
+      within(confirmation).getByRole("checkbox", {
+        name: /I understand that every connected display/i,
+      }),
+    );
+    await user.click(
+      within(confirmation).getByRole("button", {
+        name: "Start recording with screen",
+      }),
+    );
 
     expect(
       screen.getByRole("heading", { name: "Live draft" }),
@@ -128,6 +141,19 @@ describe("SayTrace workspace", () => {
     await user.click(
       within(dialog).getByRole("button", { name: /record a meeting/i }),
     );
+    const confirmation = screen.getByRole("dialog", {
+      name: "Review before recording",
+    });
+    await user.click(
+      within(confirmation).getByRole("checkbox", {
+        name: /I understand that every connected display/i,
+      }),
+    );
+    await user.click(
+      within(confirmation).getByRole("button", {
+        name: "Start recording with screen",
+      }),
+    );
 
     expect(
       screen.getByText("Live draft captions are off for this recording."),
@@ -137,6 +163,69 @@ describe("SayTrace workspace", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.getByText(/saved tracks will be transcribed after you stop/i),
+    ).toBeInTheDocument();
+  });
+
+  it("defaults screen context on and requires explicit final whole-desktop acknowledgement", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      screen.getByRole("button", { name: /new transcription/i }),
+    );
+    const dialog = screen.getByRole("dialog", { name: "New transcription" });
+    expect(
+      within(dialog).getByRole("checkbox", {
+        name: /Record all connected displays/i,
+      }),
+    ).toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", {
+        name: /Add relevant screenshots to the transcript/i,
+      }),
+    ).toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", {
+        name: /Use meeting-app visual cues to suggest speakers/i,
+      }),
+    ).toBeChecked();
+    expect(
+      within(dialog).getByText(/Everything visible across all connected displays/i),
+    ).toBeInTheDocument();
+
+    const recordButton = within(dialog).getByRole("button", {
+      name: /record a meeting/i,
+    });
+    expect(recordButton).toBeEnabled();
+    await user.click(recordButton);
+
+    const confirmation = screen.getByRole("dialog", {
+      name: "Review before recording",
+    });
+    const startButton = within(confirmation).getByRole("button", {
+      name: "Start recording with screen",
+    });
+    expect(startButton).toBeDisabled();
+    expect(
+      within(confirmation).getByText("Screen recording is ON"),
+    ).toBeInTheDocument();
+    await user.click(
+      within(confirmation).getByRole("checkbox", {
+        name: /I understand that every connected display/i,
+      }),
+    );
+    expect(startButton).toBeEnabled();
+    await user.click(startButton);
+
+    expect(
+      screen.getByText("All connected displays are being recorded"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Screen capture active")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Relevant screenshots enabled/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Visual speaker suggestions enabled/),
     ).toBeInTheDocument();
   });
 
@@ -165,6 +254,15 @@ describe("SayTrace workspace", () => {
 
     await user.click(screen.getByRole("tab", { name: "Speakers" }));
 
+    expect(
+      screen.getByText("Visual suggestion · Review", {
+        selector: ".speaker-card__visual-evidence strong",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Microsoft Teams highlighted Sam Rivera/i),
+    ).toBeInTheDocument();
+
     await user.click(
       screen.getByRole("button", { name: /create voice profile/i }),
     );
@@ -192,7 +290,7 @@ describe("SayTrace workspace", () => {
     );
 
     expect(screen.getByText("Speaker matched to Sam Rivera.")).toBeInTheDocument();
-    expect(screen.getByText("Sam Rivera", { selector: ".speaker-card strong" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show only Sam Rivera" })).toBeInTheDocument();
   });
 
   it("commits an inline speaker rename when focus leaves the field", async () => {
@@ -209,7 +307,7 @@ describe("SayTrace workspace", () => {
     await user.tab();
 
     expect(
-      screen.getByText("Alex Morgan", { selector: ".speaker-card strong" }),
+      screen.getByRole("button", { name: "Show only Alex Morgan" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Speaker renamed.")).toBeInTheDocument();
   });
@@ -223,8 +321,8 @@ describe("SayTrace workspace", () => {
     await user.click(screen.getByText(/One thing to note/));
 
     expect(
-      screen.getByText("Speaker 3", { selector: ".speaker-card.is-selected strong" }),
-    ).toBeInTheDocument();
+      screen.getByRole("button", { name: "Show only Speaker 3" }).closest("[data-speaker-id]"),
+    ).toHaveAttribute("aria-current", "true");
   });
 
   it("automatically creates a voice profile when an unknown speaker is renamed", async () => {
@@ -246,7 +344,7 @@ describe("SayTrace workspace", () => {
       screen.getByText("Speaker renamed and voice profile updated automatically."),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Taylor Reed", { selector: ".speaker-card strong" }),
+      screen.getByRole("button", { name: "Show only Taylor Reed" }),
     ).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Voice profiles" }));

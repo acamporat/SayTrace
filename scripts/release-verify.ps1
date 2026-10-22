@@ -222,6 +222,7 @@ function Assert-SourceReleaseContracts {
     if (
         -not $runtimeReleaseScript.Contains("cpu_fallback_declared") -or
         -not $runtimeReleaseScript.Contains('worker_handshake = "passed_by_packager"') -or
+        -not $runtimeReleaseScript.Contains("required_ml_components") -or
         -not $runtimeReleaseScript.Contains("verify-worker-runtime.ps1") -or
         -not $runtimeReleaseScript.Contains('model_inference  = "not_performed_by_packager"')
     ) {
@@ -259,6 +260,10 @@ function Assert-SourceReleaseContracts {
         -not $bundledRuntimePreflight.Contains("Get-AuthenticodeSignature") -or
         -not $bundledRuntimePreflight.Contains("minimum_ollama_driver_version") -or
         -not $workerVerify.Contains("ExpectedProtocolVersion") -or
+        -not $workerVerify.Contains('"faster_whisper"') -or
+        -not $workerVerify.Contains('"whisperx"') -or
+        -not $workerVerify.Contains('"pyannote.audio"') -or
+        -not $workerVerify.Contains('"torch"') -or
         -not $setupBundleScript.Contains("LTRSFXBUNDLE0001")
     ) {
         throw "The one-file setup must preflight, verify, stage, and atomically add every local dependency."

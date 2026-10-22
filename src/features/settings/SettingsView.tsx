@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   Archive,
   Check,
@@ -21,6 +22,8 @@ interface SettingsViewProps {
   workerStatus: AppStatus["worker"];
   onOpenSetup: () => void;
   onBackup: () => void;
+  onExportSpeakers: () => Promise<string>;
+  onImportSpeakers: () => Promise<string>;
   onCheckModels: () => void;
   onOpenLibrary: () => void;
   onRestartWorker: () => void;
@@ -31,6 +34,8 @@ export function SettingsView({
   workerStatus,
   onOpenSetup,
   onBackup,
+  onExportSpeakers,
+  onImportSpeakers,
   onCheckModels,
   onOpenLibrary,
   onRestartWorker,
@@ -212,6 +217,7 @@ export function SettingsView({
           <button className="settings-action" type="button" onClick={onBackup}>
             <Archive size={18} /> Create library backup
           </button>
+          <SpeakerRecovery onExport={onExportSpeakers} onImport={onImportSpeakers} />
         </section>
 
         <section className="settings-section settings-section--privacy">
@@ -221,8 +227,9 @@ export function SettingsView({
             <div>
               <strong>Designed for offline use</strong>
               <p>
-                Recordings, transcripts, and voice profiles remain on this
-                device. Processing never needs a listening network port.
+                Recordings and voice profiles stay on this device. Transcription
+                and local AI work offline. Optional ChatGPT questions send
+                meeting text to OpenAI only after you allow sharing in the Ask panel.
               </p>
             </div>
           </div>
@@ -234,4 +241,30 @@ export function SettingsView({
       </div>
     </main>
   );
+}
+
+function SpeakerRecovery({ onExport, onImport }: {
+  onExport: () => Promise<string>;
+  onImport: () => Promise<string>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  async function run(action: () => Promise<string>) {
+    setBusy(true);
+    try { setMessage(await action()); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Speaker backup could not be completed."); }
+    finally { setBusy(false); }
+  }
+  return <div className="speaker-recovery">
+    <h3>Speaker matches</h3>
+    <p>Save voice profiles and meeting speaker matches to a backup file you can keep across app updates. Restore on this Windows installation using the same account; meeting matches require the original meeting library. Restore replaces saved matches for matching speakers.</p>
+    <p>The latest 50 automatic speaker snapshots are kept in %LOCALAPPDATA%\com.localtranscript.desktop\backups\speakers. Use Restore speaker backup to select one.</p>
+    <button className="settings-action" type="button" disabled={busy} onClick={() => void run(onExport)}>
+      <Archive size={18} /> Save speaker backup
+    </button>
+    <button className="settings-action" type="button" disabled={busy} onClick={() => void run(onImport)}>
+      <RefreshCw size={18} /> Restore speaker backup
+    </button>
+    {message && <p role="status">{message}</p>}
+  </div>;
 }

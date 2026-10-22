@@ -4,6 +4,7 @@ import {
   HardDrive,
   Info,
   Mic,
+  Monitor,
   MonitorSpeaker,
   MoreVertical,
   Pause,
@@ -41,6 +42,9 @@ interface RecordingViewProps {
   outputDeviceId: string;
   microphoneIsPersonal: boolean;
   liveCaptionsEnabled: boolean;
+  captureScreen: boolean;
+  autoScreenshots: boolean;
+  visualSpeakerAttribution: boolean;
   availableStorageGb: number;
   onRenameMeeting: (title: string) => void;
   onTogglePause: () => void;
@@ -61,6 +65,9 @@ export function RecordingView({
   outputDeviceId,
   microphoneIsPersonal,
   liveCaptionsEnabled,
+  captureScreen,
+  autoScreenshots,
+  visualSpeakerAttribution,
   availableStorageGb,
   onRenameMeeting,
   onTogglePause,
@@ -70,6 +77,7 @@ export function RecordingView({
   const paused = session?.state === "paused";
   const microphoneActive = status.microphoneActive && !paused;
   const systemAudioActive = status.systemAudioActive && !paused;
+  const screenCaptureActive = status.screenCaptureActive && !paused;
   const [elapsed, setElapsed] = useState(
     session?.elapsedMs ?? (session ? 0 : 1_122_000),
   );
@@ -247,6 +255,36 @@ export function RecordingView({
             />
           </div>
 
+          {captureScreen ? (
+            <div className="source-row source-row--screen">
+              <Monitor className="source-row__icon" size={24} />
+              <div className="screen-source-label">
+                <strong>All connected displays</strong>
+                <small>Whole-desktop video</small>
+              </div>
+              <div
+                className={`screen-capture-state${
+                  screenCaptureActive ? " is-active" : ""
+                }${paused ? " is-paused" : ""}`}
+                role="status"
+                aria-live="polite"
+              >
+                <span aria-hidden="true" />
+                {paused
+                  ? "Screen capture paused"
+                  : screenCaptureActive
+                    ? "All connected displays are being recorded"
+                    : "Screen capture needs attention"}
+              </div>
+              <Info size={18} aria-hidden="true" />
+              <span className="screen-capture-features-summary">
+                {autoScreenshots ? "Screenshots on" : "Screenshots off"}
+                {" · "}
+                {visualSpeakerAttribution ? "Visual speakers on" : "Visual speakers off"}
+              </span>
+            </div>
+          ) : null}
+
           <section className="live-draft" aria-label="Live draft captions">
             <header>
               <h2>Live draft</h2>
@@ -303,7 +341,32 @@ export function RecordingView({
               <li>
                 <span /> Saved locally
               </li>
+              {captureScreen ? (
+                <li
+                  className={
+                    screenCaptureActive || paused ? undefined : "is-failed"
+                  }
+                >
+                  <span /> Screen capture{" "}
+                  {paused
+                    ? "paused"
+                    : screenCaptureActive
+                      ? "active"
+                      : "needs attention"}
+                </li>
+              ) : null}
             </ul>
+            {captureScreen ? (
+              <p className="recording-health__visual-context">
+                {autoScreenshots
+                  ? "Relevant screenshots enabled"
+                  : "Relevant screenshots off"}
+                {" · "}
+                {visualSpeakerAttribution
+                  ? "Visual speaker suggestions enabled"
+                  : "Visual speaker suggestions off"}
+              </p>
+            ) : null}
             {status.warning ? (
               <p className="recording-health__warning" role="alert">
                 {status.warning}

@@ -8,7 +8,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::CoreResult;
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS app_meta (
@@ -321,6 +321,44 @@ CREATE INDEX IF NOT EXISTS idx_transcript_chat_meeting
 ON transcript_chat_messages(meeting_id, created_at_ms, id);
 "#;
 
+const MIGRATION_6: &str = r#"
+ALTER TABLE meeting_speakers ADD COLUMN attribution_source TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE meeting_speakers ADD COLUMN attribution_confidence TEXT;
+
+CREATE TABLE IF NOT EXISTS visual_context_runs (
+    meeting_id TEXT PRIMARY KEY NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    screen_asset_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+    analyzer_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running', 'complete', 'partial', 'skipped', 'failed')),
+    vision_model TEXT,
+    warning TEXT,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS visual_context_events (
+    id TEXT PRIMARY KEY NOT NULL,
+    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL REFERENCES transcript_turns(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('shared_content', 'important_moment', 'speaker_evidence')),
+    at_ms INTEGER NOT NULL CHECK(at_ms >= 0),
+    screenshot_asset_id TEXT REFERENCES media_assets(id) ON DELETE SET NULL,
+    reason TEXT NOT NULL,
+    trigger_text TEXT,
+    confidence TEXT NOT NULL CHECK(confidence IN ('high', 'review')),
+    source TEXT NOT NULL,
+    speaker_id TEXT REFERENCES meeting_speakers(id) ON DELETE SET NULL,
+    suggested_speaker_name TEXT,
+    meeting_system TEXT,
+    created_at_ms INTEGER NOT NULL,
+    UNIQUE(meeting_id, turn_id, kind, at_ms)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_visual_context_meeting_time
+ON visual_context_events(meeting_id, at_ms, id);
+CREATE INDEX IF NOT EXISTS idx_visual_context_speaker
+ON visual_context_events(meeting_id, speaker_id, kind);
+"#;
+
 #[derive(Debug, Clone)]
 pub struct Database {
     path: PathBuf,
@@ -393,6 +431,13 @@ impl Database {
             transaction.pragma_update(None, "user_version", 5)?;
             transaction.commit()?;
         }
+        if current < 6 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(MIGRATION_6)?;
+            transaction.pragma_update(None, "user_version", 6)?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 }
@@ -432,9 +477,28 @@ mod tests {
         let journal_mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
+        let mut column_statement = connection
+            .prepare("PRAGMA table_info(meeting_speakers)")
+            .unwrap();
+        let speaker_columns = column_statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let visual_event_table: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name='visual_context_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert!(speaker_columns.contains(&"attribution_source".to_string()));
+        assert!(speaker_columns.contains(&"attribution_confidence".to_string()));
+        assert_eq!(visual_event_table, 1);
         assert_eq!(first.path(), second.path());
     }
 

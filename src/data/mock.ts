@@ -5,6 +5,7 @@ import type {
   MeetingSpeaker,
   ModelPackStatus,
   TranscriptTurn,
+  VisualContextEvent,
   VoiceProfile,
   WordTiming,
 } from "../types";
@@ -102,7 +103,8 @@ export const speakers: MeetingSpeaker[] = [
     color: "#676c72",
     initials: "S3",
     state: "Review",
-    profileId: "profile-sam",
+    attributionSource: "visual",
+    attributionConfidence: "review",
   },
 ];
 
@@ -175,6 +177,38 @@ export const transcriptTurns: TranscriptTurn[] = [
     startMs: 332_000,
     endMs: 365_000,
     modelText: "Also, when are we thinking of rolling this out to everyone?",
+  },
+];
+
+export const visualContext: VisualContextEvent[] = [
+  {
+    id: "visual-context-shared-screen",
+    meetingId: "weekly-production",
+    turnId: "turn-2",
+    kind: "shared_content",
+    atMs: 96_000,
+    screenshotAssetId: "preview-shared-screen",
+    reason: "Captured when the shared onboarding flow was discussed.",
+    triggerText: "the new onboarding flow",
+    confidence: "high",
+    source: "transcript_heuristic",
+    meetingSystem: "Microsoft Teams",
+    createdAtMs: 96_000,
+  },
+  {
+    id: "visual-context-speaker-evidence",
+    meetingId: "weekly-production",
+    turnId: "turn-5",
+    kind: "speaker_evidence",
+    atMs: 238_000,
+    reason:
+      "Microsoft Teams highlighted Sam Rivera's participant tile while this turn was spoken.",
+    confidence: "review",
+    source: "local_vision",
+    speakerId: "unknown",
+    suggestedSpeakerName: "Sam Rivera",
+    meetingSystem: "Microsoft Teams",
+    createdAtMs: 238_000,
   },
 ];
 
